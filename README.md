@@ -33,7 +33,7 @@ Neither works for direct-cabled RDMA meshes. This plugin does.
                       (100Gbps)
 ```
 
-**Three NVIDIA DGX Spark workstations** connected in a triangle mesh with direct 100Gbps RDMA cables. Each link is on a **different subnet** - a configuration NVIDIA never intended to support.
+**Three DGX Spark workstations** connected in a triangle mesh with direct 100Gbps RDMA cables. Each link is on a **different subnet** - a configuration NVIDIA never intended to support.
 
 ## 🚀 Results
 
@@ -45,16 +45,6 @@ Neither works for direct-cabled RDMA meshes. This plugin does.
 | Link Speed | 100 Gbps per link |
 
 Successfully ran **distributed LLM inference** (Mistral-7B) across all 3 nodes using NCCL over this custom topology.
-
-## ⚡ Unified Memory Advantage
-
-On **Grace Hopper / DGX Spark** systems, the GPU and CPU share the same physical memory via NVLink-C2C. This unified memory architecture means:
-
-- **No staging copies** - RDMA operates directly on GPU-accessible memory
-- **GPUDirect-like performance** - Without additional kernel modules or configuration
-- **Simplified memory management** - Register once, use everywhere
-
-The 8+ GB/s bandwidth is the real deal, not bottlenecked by GPU↔Host transfers.
 
 ## 🏗️ Architecture
 
@@ -81,7 +71,7 @@ The 8+ GB/s bandwidth is the real deal, not bottlenecked by GPU↔Host transfers
 - Raw InfiniBand Verbs API (libibverbs)
 - Reliable Connected (RC) Queue Pairs
 - RoCE v2 over Ethernet
-- Zero-copy on unified memory systems
+- Host memory staging (GPU→Host→RDMA→Host→GPU)
 
 ## 📦 Installation
 
@@ -98,7 +88,7 @@ ibv_devices
 ### Build
 
 ```bash
-git clone https://github.com/autoscriptlabs/nccl-mesh-plugin.git
+git clone https://github.com/yourusername/nccl-mesh-plugin.git
 cd nccl-mesh-plugin
 make
 ```
@@ -221,29 +211,19 @@ for (int i = 0; i < handle->num_addrs; i++) {
 | `NCCL_MESH_GID_INDEX` | `3` | RoCE GID index to use |
 | `NCCL_MESH_DEBUG` | `0` | Enable plugin debug output |
 
-## 🚧 Current Limitations
+## 🚧 Limitations
 
-- **Single QP per connection** - No multi-rail aggregation yet
-- **No relay routing** - Non-adjacent nodes can't communicate (fine for fully-connected mesh)
-- **RoCE v2 only** - Ethernet-based RDMA, no native InfiniBand support
+- **Host memory staging**: GPU memory goes through host (no GPUDirect RDMA yet)
+- **Single QP per connection**: No multi-rail aggregation
+- **No relay routing**: Non-adjacent nodes can't communicate (fine for fully-connected mesh)
+- **RoCE v2 only**: No InfiniBand support (Ethernet only)
 
 ## 🗺️ Roadmap
 
+- [ ] GPUDirect RDMA support (bypass host memory)
 - [ ] Multi-QP per connection for higher bandwidth
-- [ ] Adaptive routing for partial mesh topologies
-- [ ] Performance tuning (inline data, selective signaling)
-- [ ] Support for non-unified-memory systems with explicit GPUDirect RDMA
-
-## 🛠️ Hardware Tested
-
-| Component | Specification |
-|-----------|--------------|
-| Nodes | 3x NVIDIA DGX Spark |
-| CPU | NVIDIA Grace (ARM64) |
-| GPU | NVIDIA Blackwell |
-| Memory | Unified (NVLink-C2C) |
-| NICs | ConnectX-7 (100GbE) |
-| Cables | Direct-attach QSFP56 |
+- [ ] Adaptive routing for partial meshes
+- [ ] Performance tuning (inline data, signaling)
 
 ## 📚 References
 
@@ -257,8 +237,8 @@ MIT License - see [LICENSE](LICENSE) file.
 
 ## 🙏 Acknowledgments
 
-Built to connect three DGX Spark workstations that NVIDIA never intended to cluster. Sometimes the best solutions come from ignoring "supported configurations."
+Built to connect three DGX Spark workstations that NVIDIA never intended to be clustered. Sometimes the best solutions come from ignoring "supported configurations."
 
 ---
 
-*"The future of distributed AI computing is here."* — Mistral-7B, running distributed inference on this very plugin
+*"The future of distributed AI computing is here."* - Mistral-7B, running on this very plugin
