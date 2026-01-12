@@ -212,10 +212,13 @@ struct mesh_plugin_state {
     int num_nics;
     int initialized;
 
-    // Configuration
-    int gid_index;              // From NCCL_MESH_GID_INDEX
-    int debug;                  // From NCCL_MESH_DEBUG
-    int fast_fail;              // From NCCL_MESH_FAST_FAIL: reduce retries for faster failure detection
+    // Configuration from environment variables
+    int gid_index;              // NCCL_MESH_GID_INDEX: RoCE GID index (default: 3)
+    int debug_level;            // NCCL_MESH_DEBUG: 0=off, 1=info, 2=verbose (default: 0)
+    int fast_fail;              // NCCL_MESH_FAST_FAIL: reduce retries for faster failure detection
+    int timeout_ms;             // NCCL_MESH_TIMEOUT_MS: connection timeout in ms (default: 5000)
+    int retry_count;            // NCCL_MESH_RETRY_COUNT: retry attempts (default: 3)
+    int disable_rdma;           // NCCL_MESH_DISABLE_RDMA: force TCP fallback (not implemented)
 
     // Logging (provided by NCCL)
     void (*log_fn)(int level, unsigned long flags, const char *file,
@@ -255,6 +258,7 @@ int mesh_get_interface_ip(const char *if_name, uint32_t *ip, uint32_t *mask);
 const char* mesh_find_netdev_for_rdma(const char *rdma_dev);
 
 // Logging macros
+// NCCL_MESH_DEBUG levels: 0=off, 1=info/errors, 2=verbose/trace
 #define MESH_LOG(level, fmt, ...) \
     do { \
         if (g_mesh_state.log_fn) { \
@@ -262,9 +266,18 @@ const char* mesh_find_netdev_for_rdma(const char *rdma_dev);
         } \
     } while(0)
 
-#define MESH_INFO(fmt, ...) MESH_LOG(NCCL_LOG_INFO, "MESH " fmt, ##__VA_ARGS__)
+// MESH_WARN: Always logged (errors and warnings)
 #define MESH_WARN(fmt, ...) MESH_LOG(NCCL_LOG_WARN, "MESH " fmt, ##__VA_ARGS__)
+
+// MESH_INFO: Logged at debug_level >= 1 (informational messages)
+#define MESH_INFO(fmt, ...) \
+    do { if (g_mesh_state.debug_level >= 1) MESH_LOG(NCCL_LOG_INFO, "MESH " fmt, ##__VA_ARGS__); } while(0)
+
+// MESH_DEBUG: Logged at debug_level >= 2 (verbose/trace messages)
 #define MESH_DEBUG(fmt, ...) \
-    do { if (g_mesh_state.debug) MESH_LOG(NCCL_LOG_TRACE, "MESH " fmt, ##__VA_ARGS__); } while(0)
+    do { if (g_mesh_state.debug_level >= 2) MESH_LOG(NCCL_LOG_TRACE, "MESH " fmt, ##__VA_ARGS__); } while(0)
+
+// MESH_TRACE: Alias for MESH_DEBUG (very verbose tracing)
+#define MESH_TRACE(fmt, ...) MESH_DEBUG(fmt, ##__VA_ARGS__)
 
 #endif // NCCL_MESH_PLUGIN_H

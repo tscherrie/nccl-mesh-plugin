@@ -210,8 +210,11 @@ for (int i = 0; i < handle->num_addrs; i++) {
 | `NCCL_NET_PLUGIN` | - | Set to `mesh` to use this plugin |
 | `NCCL_DEBUG` | `WARN` | Set to `INFO` for detailed logs |
 | `NCCL_MESH_GID_INDEX` | `3` | RoCE GID index to use |
-| `NCCL_MESH_DEBUG` | `0` | Enable plugin debug output |
+| `NCCL_MESH_DEBUG` | `0` | Debug verbosity: 0=off, 1=info, 2=verbose/trace |
+| `NCCL_MESH_TIMEOUT_MS` | `5000` | Connection timeout in milliseconds |
+| `NCCL_MESH_RETRY_COUNT` | `3` | Number of retry attempts for connections |
 | `NCCL_MESH_FAST_FAIL` | `0` | Fast failure detection (reduced retries). Set to `1` if nodes may OOM/crash |
+| `NCCL_MESH_DISABLE_RDMA` | `0` | Force TCP fallback (not yet implemented) |
 
 ## 🚧 Current Limitations
 

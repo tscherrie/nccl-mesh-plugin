@@ -351,24 +351,30 @@ int mesh_accept_handshake(int listen_sock, struct mesh_qp_info *remote_info, str
 /*
  * Connect, send our QP info, and receive remote's QP info
  * Uses non-blocking connect with select() to avoid deadlock
+ * Retry timing controlled by NCCL_MESH_TIMEOUT_MS and NCCL_MESH_RETRY_COUNT
  */
-int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port, 
+int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port,
                         struct mesh_qp_info *local_info, struct mesh_qp_info *remote_info) {
     int sock;
     struct sockaddr_in addr;
-    int retries = 100;  // 10 seconds total
     int connected = 0;
-    
+
+    // Calculate retry parameters from config
+    // timeout_ms spread across retry_count attempts, with 100ms per attempt
+    int retry_interval_ms = 100;
+    int max_retries = g_mesh_state.timeout_ms / retry_interval_ms;
+    if (max_retries < g_mesh_state.retry_count) max_retries = g_mesh_state.retry_count;
+    int retries = max_retries;
+
     char ip_str[INET_ADDRSTRLEN];
     mesh_uint_to_ip(remote_ip, ip_str, sizeof(ip_str));
-    // // fprintf(stderr, "MESH DEBUG: send_handshake connecting to %s:%d\n", ip_str, remote_port);
-    fflush(stderr);
-    
+    MESH_DEBUG("send_handshake: connecting to %s:%d (max_retries=%d)", ip_str, remote_port, max_retries);
+
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(remote_ip);
     addr.sin_port = htons(remote_port);
-    
+
     // Retry connection - peer's accept() might not be ready yet
     while (retries > 0 && !connected) {
         sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -376,11 +382,11 @@ int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port,
             MESH_WARN("Failed to create handshake socket: %s", strerror(errno));
             return -1;
         }
-        
+
         // Set non-blocking
         int flags = fcntl(sock, F_GETFL, 0);
         fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-        
+
         int ret = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
         if (ret == 0) {
             connected = 1;
@@ -391,8 +397,8 @@ int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port,
             FD_ZERO(&writefds);
             FD_SET(sock, &writefds);
             tv.tv_sec = 0;
-            tv.tv_usec = 100000;  // 100ms
-            
+            tv.tv_usec = retry_interval_ms * 1000;
+
             ret = select(sock + 1, NULL, &writefds, NULL, &tv);
             if (ret > 0) {
                 // Check if connection succeeded
@@ -412,12 +418,12 @@ int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port,
         } else {
             close(sock);
             retries--;
-            usleep(100000);  // 100ms before retry
+            usleep(retry_interval_ms * 1000);
         }
     }
-    
+
     if (!connected) {
-        MESH_WARN("Failed to connect handshake socket after retries");
+        MESH_WARN("Failed to connect handshake socket to %s:%d after %d retries", ip_str, remote_port, max_retries);
         return -1;
     }
     
@@ -425,8 +431,6 @@ int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port,
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
     
-    // // fprintf(stderr, "MESH DEBUG: TCP handshake connected to %s:%d!\n", ip_str, remote_port);
-    fflush(stderr);
     
     // Send our QP info
     ssize_t n = send(sock, local_info, sizeof(*local_info), 0);
@@ -436,8 +440,6 @@ int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port,
         return -1;
     }
     
-    // // fprintf(stderr, "MESH DEBUG: Sent QP info, waiting for response...\n");
-    fflush(stderr);
     
     // Receive remote's QP info (the accept side's NEW QP)
     n = recv(sock, remote_info, sizeof(*remote_info), MSG_WAITALL);
@@ -447,8 +449,6 @@ int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port,
         return -1;
     }
     
-    // // fprintf(stderr, "MESH DEBUG: Received remote QP info: qp_num=%u\n", ntohl(remote_info->qp_num));
-    fflush(stderr);
     
     close(sock);
     return 0;
@@ -461,8 +461,6 @@ int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port,
 static void *handshake_thread_func(void *arg) {
     struct mesh_listen_comm *lcomm = (struct mesh_listen_comm *)arg;
     
-    // // fprintf(stderr, "MESH DEBUG: Handshake thread started, sock=%d\n", lcomm->handshake_sock);
-    fflush(stderr);
     
     // Set socket to non-blocking so we can check stop flag
     int flags = fcntl(lcomm->handshake_sock, F_GETFL, 0);
@@ -483,22 +481,17 @@ static void *handshake_thread_func(void *arg) {
         
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
-        // // fprintf(stderr, "MESH DEBUG: Handshake thread: connection from %s\n", ip_str);
-        fflush(stderr);
         
         // Receive remote QP info
         struct mesh_qp_info remote_info;
         ssize_t n = recv(conn_sock, &remote_info, sizeof(remote_info), MSG_WAITALL);
         if (n != sizeof(remote_info)) {
-            // // fprintf(stderr, "MESH DEBUG: Handshake thread: failed to recv, got %zd\n", n);
             close(conn_sock);
             continue;
         }
         
-        // // fprintf(stderr, "MESH DEBUG: Handshake thread: received QP %u, nic_idx=%d\n", 
-                ntohl(remote_info.qp_num), remote_info.nic_idx);
-        fflush(stderr);
-        
+        MESH_DEBUG("Handshake thread: received QP %u, nic_idx=%d", ntohl(remote_info.qp_num), remote_info.nic_idx);
+
         // Select NIC based on nic_idx from remote
         int nic_idx = remote_info.nic_idx;
         if (nic_idx >= lcomm->num_qps) nic_idx = 0;
@@ -508,15 +501,12 @@ static void *handshake_thread_func(void *arg) {
         struct ibv_qp *new_qp = NULL;
         struct ibv_cq *new_cq = NULL;
         if (mesh_create_qp(nic, &new_qp, &new_cq) != 0) {
-            // // fprintf(stderr, "MESH DEBUG: Handshake thread: failed to create QP\n");
             close(conn_sock);
             continue;
         }
         
-        // // fprintf(stderr, "MESH DEBUG: Handshake thread: created QP %d on %s\n", 
-                new_qp->qp_num, nic->dev_name);
-        fflush(stderr);
-        
+        MESH_DEBUG("Handshake thread: created QP %d on %s", new_qp->qp_num, nic->dev_name);
+
         // Connect our QP to remote's QP
         struct mesh_handle connect_handle;
         memset(&connect_handle, 0, sizeof(connect_handle));
@@ -535,17 +525,14 @@ static void *handshake_thread_func(void *arg) {
         connect_handle.gid = remote_gid;
         
         if (mesh_connect_qp(new_qp, nic, &connect_handle) != 0) {
-            // // fprintf(stderr, "MESH DEBUG: Handshake thread: failed to connect QP\n");
             ibv_destroy_qp(new_qp);
             ibv_destroy_cq(new_cq);
             close(conn_sock);
             continue;
         }
         
-        // // fprintf(stderr, "MESH DEBUG: Handshake thread: QP connected to remote QP %d\n", 
-                connect_handle.qp_num);
-        fflush(stderr);
-        
+        MESH_DEBUG("Handshake thread: QP connected to remote QP %d", connect_handle.qp_num);
+
         // Send our QP info back
         struct mesh_qp_info local_info;
         memset(&local_info, 0, sizeof(local_info));
@@ -558,16 +545,13 @@ static void *handshake_thread_func(void *arg) {
         close(conn_sock);
         
         if (n != sizeof(local_info)) {
-            // // fprintf(stderr, "MESH DEBUG: Handshake thread: failed to send response\n");
             ibv_destroy_qp(new_qp);
             ibv_destroy_cq(new_cq);
             continue;
         }
         
-        // // fprintf(stderr, "MESH DEBUG: Handshake thread: sent QP %d back, queueing for accept\n", 
-                new_qp->qp_num);
-        fflush(stderr);
-        
+        MESH_DEBUG("Handshake thread: sent QP %d back, queueing for accept", new_qp->qp_num);
+
         // Queue this handshake for accept() to consume
         pthread_mutex_lock(&lcomm->queue_mutex);
         int next_tail = (lcomm->queue_tail + 1) % HANDSHAKE_QUEUE_SIZE;
@@ -581,15 +565,12 @@ static void *handshake_thread_func(void *arg) {
             lcomm->queue_tail = next_tail;
             pthread_cond_signal(&lcomm->queue_cond);
         } else {
-            // // fprintf(stderr, "MESH DEBUG: Handshake thread: queue full!\n");
             ibv_destroy_qp(new_qp);
             ibv_destroy_cq(new_cq);
         }
         pthread_mutex_unlock(&lcomm->queue_mutex);
     }
     
-    // // fprintf(stderr, "MESH DEBUG: Handshake thread exiting\n");
-    fflush(stderr);
     return NULL;
 }
 
@@ -757,19 +738,44 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     g_mesh_state.log_fn = logFunction;
 
     // Read configuration from environment
-    const char *gid_str = getenv("NCCL_MESH_GID_INDEX");
-    g_mesh_state.gid_index = gid_str ? atoi(gid_str) : 3;
+    const char *env_val;
 
-    const char *debug_str = getenv("NCCL_MESH_DEBUG");
-    g_mesh_state.debug = debug_str ? atoi(debug_str) : 0;
+    // NCCL_MESH_GID_INDEX: RoCE GID index (default: 3)
+    env_val = getenv("NCCL_MESH_GID_INDEX");
+    g_mesh_state.gid_index = env_val ? atoi(env_val) : 3;
 
-    // Fast-fail mode: reduce retries for faster peer failure detection
-    // Useful when nodes may OOM or crash during distributed training
-    const char *fast_fail_str = getenv("NCCL_MESH_FAST_FAIL");
-    g_mesh_state.fast_fail = fast_fail_str ? atoi(fast_fail_str) : 0;
+    // NCCL_MESH_DEBUG: Debug level 0=off, 1=info, 2=verbose (default: 0)
+    env_val = getenv("NCCL_MESH_DEBUG");
+    g_mesh_state.debug_level = env_val ? atoi(env_val) : 0;
 
-    MESH_INFO("Initializing Mesh plugin (gid_index=%d, debug=%d, fast_fail=%d)",
-              g_mesh_state.gid_index, g_mesh_state.debug, g_mesh_state.fast_fail);
+    // NCCL_MESH_FAST_FAIL: Enable fast failure detection (default: 0)
+    env_val = getenv("NCCL_MESH_FAST_FAIL");
+    g_mesh_state.fast_fail = env_val ? atoi(env_val) : 0;
+
+    // NCCL_MESH_TIMEOUT_MS: Connection timeout in milliseconds (default: 5000)
+    env_val = getenv("NCCL_MESH_TIMEOUT_MS");
+    g_mesh_state.timeout_ms = env_val ? atoi(env_val) : 5000;
+    if (g_mesh_state.timeout_ms < 100) g_mesh_state.timeout_ms = 100;  // Minimum 100ms
+
+    // NCCL_MESH_RETRY_COUNT: Number of retry attempts (default: 3)
+    env_val = getenv("NCCL_MESH_RETRY_COUNT");
+    g_mesh_state.retry_count = env_val ? atoi(env_val) : 3;
+    if (g_mesh_state.retry_count < 1) g_mesh_state.retry_count = 1;  // Minimum 1
+
+    // NCCL_MESH_DISABLE_RDMA: Force TCP fallback (default: 0, not implemented)
+    env_val = getenv("NCCL_MESH_DISABLE_RDMA");
+    g_mesh_state.disable_rdma = env_val ? atoi(env_val) : 0;
+
+    // Log configuration (always shown at init, regardless of debug level)
+    MESH_LOG(NCCL_LOG_INFO, "MESH Initializing: gid=%d debug=%d fast_fail=%d timeout=%dms retries=%d",
+             g_mesh_state.gid_index, g_mesh_state.debug_level, g_mesh_state.fast_fail,
+             g_mesh_state.timeout_ms, g_mesh_state.retry_count);
+
+    // Check for unsupported options
+    if (g_mesh_state.disable_rdma) {
+        MESH_WARN("NCCL_MESH_DISABLE_RDMA=1 requested but TCP fallback not implemented");
+        return ncclSystemError;
+    }
 
     if (mesh_init_nics() != 0) {
         MESH_WARN("Failed to initialize NICs");
@@ -875,8 +881,6 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     if (comm->handshake_sock >= 0) {
         if (pthread_create(&comm->handshake_thread, NULL, handshake_thread_func, comm) == 0) {
             comm->thread_running = 1;
-            // // fprintf(stderr, "MESH DEBUG: listen: Started handshake thread\n");
-            fflush(stderr);
         } else {
             MESH_WARN("Failed to start handshake thread");
         }
@@ -992,16 +996,12 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         return ncclSystemError;
     }
     
-    // // fprintf(stderr, "MESH DEBUG: connect created QP %d on NIC %s\n", comm->qp->qp_num, nic->dev_name);
-    fflush(stderr);
     
     // Do handshake FIRST to get accept's QP number
     struct mesh_qp_info remote_qp_info;
     memset(&remote_qp_info, 0, sizeof(remote_qp_info));
     
     if (handle->handshake_port > 0) {
-        // // fprintf(stderr, "MESH DEBUG: connect doing bidirectional handshake\n");
-        fflush(stderr);
         
         struct mesh_qp_info local_info;
         memset(&local_info, 0, sizeof(local_info));
@@ -1022,12 +1022,9 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         
         char hs_ip_str[INET_ADDRSTRLEN];
         mesh_uint_to_ip(handshake_ip, hs_ip_str, sizeof(hs_ip_str));
-        // // fprintf(stderr, "MESH DEBUG: Sending handshake to %s:%d\n", hs_ip_str, handle->handshake_port);
-        fflush(stderr);
         
         if (mesh_send_handshake(handshake_ip, handle->handshake_port, &local_info, &remote_qp_info) != 0) {
             MESH_WARN("connect: Bidirectional handshake failed");
-            // // fprintf(stderr, "MESH DEBUG: Handshake FAILED\n");
             ibv_destroy_qp(comm->qp);
             ibv_destroy_cq(comm->cq);
             free(comm);
@@ -1039,8 +1036,6 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         // window where the QP state may not be fully visible to us yet
         usleep(1000);  // 1ms
 
-        // // fprintf(stderr, "MESH DEBUG: Handshake complete! Remote QP=%u\n", ntohl(remote_qp_info.qp_num));
-        fflush(stderr);
     } else {
         MESH_WARN("connect: No handshake port - using listen QP (will likely fail)");
         remote_qp_info.qp_num = htonl(selected_addr->qp_num);
@@ -1069,8 +1064,6 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
     memcpy(&peer_gid.raw[12], &remote_ip_for_gid, 4);
     connect_handle.gid = peer_gid;
     
-    // // fprintf(stderr, "MESH DEBUG: connect transitioning QP to connect to remote QP %d\n", connect_handle.qp_num);
-    fflush(stderr);
     
     // Connect QP to remote
     if (mesh_connect_qp(comm->qp, nic, &connect_handle) != 0) {
@@ -1087,8 +1080,6 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
     MESH_INFO("connect: Connected to peer %s via NIC %s (local QP %d -> remote QP %d)", 
               peer_ip_str, nic->dev_name, comm->qp->qp_num, connect_handle.qp_num);
     
-    // // fprintf(stderr, "MESH DEBUG: connect returning SUCCESS, comm=%p\n", (void*)comm);
-    fflush(stderr);
     
     *sendComm = comm;
     if (sendDevComm) *sendDevComm = NULL;
@@ -1100,8 +1091,6 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
     struct mesh_listen_comm *lcomm = (struct mesh_listen_comm *)listenComm;
     struct mesh_recv_comm *rcomm;
     
-    // // fprintf(stderr, "MESH DEBUG: mesh_accept called, thread_running=%d\n", lcomm->thread_running);
-    fflush(stderr);
     
     // Allocate recv comm
     rcomm = calloc(1, sizeof(*rcomm));
@@ -1115,11 +1104,11 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
     // Wait with timeout for entry in queue
     struct timespec timeout;
     clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_sec += 30;  // 30 second timeout
+    // Accept timeout is 6x configured timeout (default: 30s for 5000ms config)
+    timeout.tv_sec += (g_mesh_state.timeout_ms / 1000) * 6;
+    if (timeout.tv_sec < 5) timeout.tv_sec = 5;  // Minimum 5 second timeout
     
     while (lcomm->queue_head == lcomm->queue_tail) {
-        // // fprintf(stderr, "MESH DEBUG: accept: waiting for handshake in queue...\n");
-        fflush(stderr);
         int rc = pthread_cond_timedwait(&lcomm->queue_cond, &lcomm->queue_mutex, &timeout);
         if (rc == ETIMEDOUT) {
             pthread_mutex_unlock(&lcomm->queue_mutex);
@@ -1141,8 +1130,6 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
     
     pthread_mutex_unlock(&lcomm->queue_mutex);
     
-    // // fprintf(stderr, "MESH DEBUG: accept: Got handshake from queue - QP=%d\n", rcomm->qp->qp_num);
-    fflush(stderr);
     
     rcomm->connected = 1;
     
@@ -1151,33 +1138,22 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
     *recvComm = rcomm;
     if (recvDevComm) *recvDevComm = NULL;
     
-    // // fprintf(stderr, "MESH DEBUG: accept returning SUCCESS\n");
-    fflush(stderr);
     
     return ncclSuccess;
 }
 
 static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, void **mhandle) {
-    // // fprintf(stderr, "MESH DEBUG: regMr ENTRY comm=%p, data=%p, size=%zu, type=%d\n", 
-            comm, data, size, type);
-    fflush(stderr);
-    
     struct mesh_send_comm *scomm = (struct mesh_send_comm *)comm;
     struct mesh_mr_handle *mrh;
     int access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
-    
-    // // fprintf(stderr, "MESH DEBUG: regMr after cast, scomm=%p\n", (void*)scomm);
-    fflush(stderr);
-    
+
+    MESH_DEBUG("regMr: comm=%p, data=%p, size=%zu, type=%d", comm, data, size, type);
+
     if (!scomm || !scomm->nic || !scomm->nic->pd) {
         MESH_WARN("regMr: invalid comm or nic");
-        // // fprintf(stderr, "MESH DEBUG: regMr invalid - scomm=%p\n", (void*)scomm);
-        if (scomm) // // fprintf(stderr, "MESH DEBUG: scomm->nic=%p\n", (void*)scomm->nic);
         return ncclSystemError;
     }
     
-    // // fprintf(stderr, "MESH DEBUG: regMr nic=%s, pd=%p\n", scomm->nic->dev_name, (void*)scomm->nic->pd);
-    fflush(stderr);
     
     mrh = calloc(1, sizeof(*mrh));
     if (!mrh) {
@@ -1187,14 +1163,10 @@ static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, vo
     mrh->mr = ibv_reg_mr(scomm->nic->pd, data, size, access_flags);
     if (!mrh->mr) {
         MESH_WARN("Failed to register MR: %s", strerror(errno));
-        // // fprintf(stderr, "MESH DEBUG: ibv_reg_mr failed: %s\n", strerror(errno));
         free(mrh);
         return ncclSystemError;
     }
     
-    // // fprintf(stderr, "MESH DEBUG: regMr success, mr=%p, lkey=%u\n", (void*)mrh->mr, mrh->mr->lkey);
-    // // fprintf(stderr, "MESH DEBUG: regMr returning mhandle=%p (mrh->mr=%p)\n", (void*)mrh, (void*)mrh->mr);
-    fflush(stderr);
     
     mrh->nic = scomm->nic;
     mrh->addr = data;
@@ -1228,15 +1200,11 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
     struct mesh_request *req;
     struct ibv_send_wr wr, *bad_wr;
     struct ibv_sge sge;
-    
+
     (void)tag;
-    
-    // // fprintf(stderr, "MESH DEBUG: isend called, comm=%p, data=%p, size=%d, mhandle=%p\n", 
-            (void*)comm, data, size, (void*)mhandle);
-    if (comm) // // fprintf(stderr, "MESH DEBUG: isend comm->qp=%p, comm->cq=%p\n", (void*)comm->qp, (void*)comm->cq);
-    if (mrh) // // fprintf(stderr, "MESH DEBUG: isend mrh->mr=%p\n", (void*)mrh->mr);
-    fflush(stderr);
-    
+
+    MESH_DEBUG("isend: comm=%p, data=%p, size=%d", (void*)comm, data, size);
+
     if (!comm || !comm->qp) {
         MESH_WARN("isend: invalid comm");
         return ncclSystemError;
@@ -1269,16 +1237,7 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
     sge.addr = (uintptr_t)data;
     sge.length = size;
     sge.lkey = mrh->mr->lkey;
-    
-    // // fprintf(stderr, "MESH DEBUG: isend sge setup, checking PDs\n");
-    // // fprintf(stderr, "MESH DEBUG: isend comm->nic->pd=%p, mrh->nic->pd=%p\n", 
-            (void*)(comm->nic ? comm->nic->pd : NULL),
-            (void*)(mrh->nic ? mrh->nic->pd : NULL));
-    if (comm->nic && mrh->nic && comm->nic->pd != mrh->nic->pd) {
-        // // fprintf(stderr, "MESH DEBUG: ERROR - isend PD MISMATCH!\n");
-    }
-    fflush(stderr);
-    
+
     // Setup send work request
     memset(&wr, 0, sizeof(wr));
     wr.wr_id = (uintptr_t)req;
@@ -1288,18 +1247,13 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_SIGNALED;
     
-    // // fprintf(stderr, "MESH DEBUG: isend about to call ibv_post_send\n");
-    fflush(stderr);
     
     if (ibv_post_send(comm->qp, &wr, &bad_wr)) {
         MESH_WARN("Failed to post send: %s", strerror(errno));
-        // // fprintf(stderr, "MESH DEBUG: ibv_post_send FAILED: %s\n", strerror(errno));
         free(req);
         return ncclSystemError;
     }
     
-    // // fprintf(stderr, "MESH DEBUG: ibv_post_send succeeded!\n");
-    fflush(stderr);
     
     *request = req;
     return ncclSuccess;
@@ -1311,36 +1265,24 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
     struct mesh_request *req;
     struct ibv_recv_wr wr, *bad_wr;
     struct ibv_sge sge;
-    
+
     (void)tags;
-    
-    // // fprintf(stderr, "MESH DEBUG: irecv called, comm=%p, n=%d\n", (void*)comm, n);
-    if (comm) // // fprintf(stderr, "MESH DEBUG: irecv comm->qp=%p, comm->cq=%p\n", (void*)comm->qp, (void*)comm->cq);
-    fflush(stderr);
-    
+
+    MESH_DEBUG("irecv: comm=%p, n=%d, sizes[0]=%d", (void*)comm, n, sizes ? sizes[0] : 0);
+
     if (!comm || !comm->qp) {
         MESH_WARN("irecv: invalid comm");
         return ncclSystemError;
     }
-    
+
     if (n != 1) {
         // For simplicity, only handle n=1 for now
         MESH_WARN("irecv with n=%d not supported yet", n);
         return ncclInternalError;
     }
-    
+
     struct mesh_mr_handle *mrh = (struct mesh_mr_handle *)mhandles[0];
-    // // fprintf(stderr, "MESH DEBUG: irecv mrh=%p, data[0]=%p, sizes[0]=%d\n", (void*)mrh, data[0], sizes[0]);
-    
-    // Check if data address looks like GPU memory (high address space)
-    uintptr_t data_addr = (uintptr_t)data[0];
-    if (data_addr > 0x100000000ULL && data_addr < 0x800000000000ULL) {
-        // // fprintf(stderr, "MESH DEBUG: WARNING - data address %p looks like GPU memory!\n", data[0]);
-    }
-    
-    if (mrh) // // fprintf(stderr, "MESH DEBUG: irecv mrh->mr=%p\n", (void*)mrh->mr);
-    fflush(stderr);
-    
+
     if (!mrh || !mrh->mr) {
         MESH_WARN("irecv: invalid mhandle");
         return ncclSystemError;
@@ -1353,19 +1295,13 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
         return ncclSystemError;
     }
 
-    // // fprintf(stderr, "MESH DEBUG: irecv about to access lkey\n");
-    fflush(stderr);
     uint32_t lkey = mrh->mr->lkey;
-    // // fprintf(stderr, "MESH DEBUG: irecv lkey=%u\n", lkey);
-    fflush(stderr);
 
     req = calloc(1, sizeof(*req));
     if (!req) {
         return ncclSystemError;
     }
 
-    // // fprintf(stderr, "MESH DEBUG: irecv req allocated=%p\n", (void*)req);
-    fflush(stderr);
 
     req->used = 1;
     req->size = sizes[0];
@@ -1378,23 +1314,7 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
     sge.addr = (uintptr_t)data[0];
     sge.length = sizes[0];
     sge.lkey = lkey;
-    
-    // // fprintf(stderr, "MESH DEBUG: irecv sge setup done, about to post_recv\n");
-    // // fprintf(stderr, "MESH DEBUG: irecv qp=%p\n", (void*)comm->qp);
-    // // fprintf(stderr, "MESH DEBUG: irecv comm->nic=%p, comm->nic->pd=%p\n", (void*)comm->nic, (void*)(comm->nic ? comm->nic->pd : NULL));
-    // // fprintf(stderr, "MESH DEBUG: irecv mrh->nic=%p, mrh->nic->pd=%p\n", (void*)mrh->nic, (void*)(mrh->nic ? mrh->nic->pd : NULL));
-    
-    // Check if PDs match!
-    if (comm->nic && mrh->nic && comm->nic->pd != mrh->nic->pd) {
-        // // fprintf(stderr, "MESH DEBUG: ERROR - PD MISMATCH! QP PD != MR PD\n");
-    }
-    fflush(stderr);
-    
-    // Skip QP query - just try the post directly
-    // // fprintf(stderr, "MESH DEBUG: irecv skipping QP query, going straight to post_recv\n");
-    // // fprintf(stderr, "MESH DEBUG: irecv about to call ibv_post_recv, qp=%p\n", (void*)comm->qp);
-    fflush(stderr);
-    
+
     // Setup receive work request
     memset(&wr, 0, sizeof(wr));
     wr.wr_id = (uintptr_t)req;
@@ -1404,13 +1324,10 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
     
     if (ibv_post_recv(comm->qp, &wr, &bad_wr)) {
         MESH_WARN("Failed to post recv: %s", strerror(errno));
-        // // fprintf(stderr, "MESH DEBUG: ibv_post_recv FAILED: %s\n", strerror(errno));
         free(req);
         return ncclSystemError;
     }
     
-    // // fprintf(stderr, "MESH DEBUG: ibv_post_recv succeeded!\n");
-    fflush(stderr);
     
     *request = req;
     return ncclSuccess;
