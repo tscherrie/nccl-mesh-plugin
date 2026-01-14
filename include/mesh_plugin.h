@@ -365,6 +365,13 @@ struct mesh_plugin_state {
     // Async connect state (TICKET-7)
     struct mesh_async_connect_state async_connect;
 
+    // TICKET-8: Request tracking for leak detection
+    uint64_t requests_allocated;        // Total requests allocated
+    uint64_t requests_freed;            // Total requests freed
+    uint64_t tcp_requests_allocated;    // TCP requests allocated
+    uint64_t tcp_requests_freed;        // TCP requests freed
+    uint64_t ops_completed;             // Total send/recv operations completed
+
     // Logging (provided by NCCL)
     void (*log_fn)(int level, unsigned long flags, const char *file,
                    int line, const char *fmt, ...);
