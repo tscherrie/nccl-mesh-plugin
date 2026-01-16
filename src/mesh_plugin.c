@@ -1648,8 +1648,13 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
     fcntl(comm->sock, F_SETFL, flags | O_NONBLOCK);
 
     // Try to send size header (4 bytes, network byte order)
+    // TICKET-10: Handle EINTR and retry for transient errors
     uint32_t net_size = htonl(size);
-    ssize_t sent = send(comm->sock, &net_size, sizeof(net_size), MSG_NOSIGNAL);
+    ssize_t sent;
+    do {
+        sent = send(comm->sock, &net_size, sizeof(net_size), MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+
     if (sent < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // Can't even send header yet - return for polling
@@ -1677,8 +1682,12 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
     req->header_sent = 1;
 
     // Try to send as much data as possible without blocking
+    // TICKET-10: Handle EINTR properly
     while (req->offset < (size_t)size) {
-        sent = send(comm->sock, (char *)data + req->offset, size - req->offset, MSG_NOSIGNAL);
+        do {
+            sent = send(comm->sock, (char *)data + req->offset, size - req->offset, MSG_NOSIGNAL);
+        } while (sent < 0 && errno == EINTR);
+
         if (sent <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 // Socket buffer full - return for async completion in test()
@@ -1707,6 +1716,7 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
 
 /*
  * TCP receive - receive data over TCP socket with framing
+ * TICKET-10: Made truly async like isend to prevent deadlock
  */
 static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *sizes,
                                    int *tags, void **mhandles, void **request) {
@@ -1743,15 +1753,21 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
     req->comm = comm;
     req->done = 0;
     req->error = 0;
+    req->offset = 0;
+    req->header_recvd = 0;
+    req->msg_size = 0;
 
     // Set socket to non-blocking for async receive
     int flags = fcntl(comm->sock, F_GETFL, 0);
     fcntl(comm->sock, F_SETFL, flags | O_NONBLOCK);
 
     // Try to peek at the size header first to check availability
-    // TICKET-10: Don't use MSG_WAITALL on non-blocking socket - it's unreliable
+    // TICKET-10: Handle EINTR properly
     uint32_t net_size;
-    ssize_t recvd = recv(comm->sock, &net_size, sizeof(net_size), MSG_PEEK);
+    ssize_t recvd;
+    do {
+        recvd = recv(comm->sock, &net_size, sizeof(net_size), MSG_PEEK);
+    } while (recvd < 0 && errno == EINTR);
 
     if (recvd == 0) {
         // Connection closed
@@ -1784,7 +1800,10 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
     }
 
     // Full header available via peek, now consume it
-    recvd = recv(comm->sock, &net_size, sizeof(net_size), 0);
+    do {
+        recvd = recv(comm->sock, &net_size, sizeof(net_size), 0);
+    } while (recvd < 0 && errno == EINTR);
+
     if (recvd != sizeof(net_size)) {
         MESH_WARN("TCP irecv: Failed to consume header: %s", strerror(errno));
         comm->peer_failed = 1;
@@ -1795,49 +1814,55 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
         return ncclSystemError;
     }
 
-    // Restore blocking for data receive
-    fcntl(comm->sock, F_SETFL, flags);
-
     uint32_t msg_size = ntohl(net_size);
     if (msg_size > (uint32_t)sizes[0]) {
         MESH_WARN("TCP irecv: Message too large (%u > %d)", msg_size, sizes[0]);
+        fcntl(comm->sock, F_SETFL, flags);
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         free(req);
         return ncclSystemError;
     }
 
-    // Receive data with timeout to prevent indefinite hangs (TICKET-10)
-    size_t total_recvd = 0;
-    int timeout_retries = 0;
-    int max_timeout_retries = g_mesh_state.timeout_ms * 100;  // 100us per retry
-    while (total_recvd < msg_size) {
-        recvd = recv(comm->sock, (char *)data[0] + total_recvd, msg_size - total_recvd, 0);
-        if (recvd <= 0) {
+    req->header_recvd = 1;
+    req->msg_size = msg_size;
+
+    // Try to receive as much data as possible without blocking
+    // TICKET-10: Handle EINTR properly
+    while (req->offset < msg_size) {
+        do {
+            recvd = recv(comm->sock, (char *)data[0] + req->offset, msg_size - req->offset, 0);
+        } while (recvd < 0 && errno == EINTR);
+
+        if (recvd == 0) {
+            // Connection closed before all data received
+            MESH_WARN("TCP irecv: Connection closed during data receive");
+            comm->peer_failed = 1;
+            req->error = ECONNRESET;
+            req->done = 1;
+            fcntl(comm->sock, F_SETFL, flags);
+            *request = req;
+            return ncclSystemError;
+        } else if (recvd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (++timeout_retries > max_timeout_retries) {
-                    MESH_WARN("TCP irecv: Data receive timed out after %d ms", g_mesh_state.timeout_ms);
-                    comm->peer_failed = 1;
-                    comm->last_errno = ETIMEDOUT;
-                    req->error = ETIMEDOUT;
-                    req->done = 1;
-                    *request = req;
-                    return ncclSystemError;
-                }
-                usleep(100);
-                continue;
+                // No more data available - return for async completion in test()
+                fcntl(comm->sock, F_SETFL, flags);
+                *request = req;
+                return ncclSuccess;
             }
             MESH_WARN("TCP irecv: Failed to receive data: %s", strerror(errno));
             comm->peer_failed = 1;
             comm->last_errno = errno;
             req->error = errno;
             req->done = 1;
+            fcntl(comm->sock, F_SETFL, flags);
             *request = req;
             return ncclSystemError;
         }
-        total_recvd += recvd;
-        timeout_retries = 0;  // Reset timeout on progress
+        req->offset += recvd;
     }
 
+    // All data received
+    fcntl(comm->sock, F_SETFL, flags);
     req->size = msg_size;
     req->done = 1;
     *request = req;
@@ -1865,107 +1890,145 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         return result;
     }
 
-    // For incomplete receive, try to complete it
+    // TICKET-10: For incomplete receive, continue receiving data asynchronously
     if (!req->is_send && req->comm) {
         struct mesh_tcp_recv_comm *comm = (struct mesh_tcp_recv_comm *)req->comm;
+        ssize_t recvd;
 
-        // Try non-blocking receive of header
+        // Set socket to non-blocking
         int flags = fcntl(comm->sock, F_GETFL, 0);
         fcntl(comm->sock, F_SETFL, flags | O_NONBLOCK);
 
-        uint32_t net_size;
-        ssize_t recvd = recv(comm->sock, &net_size, sizeof(net_size), MSG_PEEK);
+        // If header not received yet, try to receive it
+        if (!req->header_recvd) {
+            uint32_t net_size;
+            do {
+                recvd = recv(comm->sock, &net_size, sizeof(net_size), MSG_PEEK);
+            } while (recvd < 0 && errno == EINTR);
 
-        if (recvd == sizeof(net_size)) {
-            // Header available via peek - consume it without MSG_WAITALL
-            // TICKET-10: Don't use MSG_WAITALL on non-blocking socket
-            recvd = recv(comm->sock, &net_size, sizeof(net_size), 0);
-            fcntl(comm->sock, F_SETFL, flags);  // Restore flags before data recv
+            if (recvd == (ssize_t)sizeof(net_size)) {
+                // Header available via peek - consume it
+                do {
+                    recvd = recv(comm->sock, &net_size, sizeof(net_size), 0);
+                } while (recvd < 0 && errno == EINTR);
 
-            if (recvd != sizeof(net_size)) {
-                // Should not happen since peek confirmed availability
-                req->error = errno ? errno : EPROTO;
+                if (recvd != sizeof(net_size)) {
+                    MESH_WARN("TCP test: Failed to consume header: %s", strerror(errno));
+                    req->error = errno ? errno : EPROTO;
+                    req->done = 1;
+                    *done = 1;
+                    fcntl(comm->sock, F_SETFL, flags);
+                    __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+                    free(req);
+                    return ncclSystemError;
+                }
+
+                uint32_t msg_size = ntohl(net_size);
+                if (msg_size > req->size) {
+                    MESH_WARN("TCP test: Message too large (%u > %zu)", msg_size, req->size);
+                    req->error = EMSGSIZE;
+                    req->done = 1;
+                    *done = 1;
+                    fcntl(comm->sock, F_SETFL, flags);
+                    __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+                    free(req);
+                    return ncclSystemError;
+                }
+
+                req->header_recvd = 1;
+                req->msg_size = msg_size;
+                req->offset = 0;
+            } else if (recvd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                // Header not ready yet
+                fcntl(comm->sock, F_SETFL, flags);
+                *done = 0;
+                return ncclSuccess;
+            } else if (recvd == 0) {
+                // Connection closed
+                MESH_WARN("TCP test: Connection closed by peer");
+                req->error = ECONNRESET;
                 req->done = 1;
                 *done = 1;
+                fcntl(comm->sock, F_SETFL, flags);
+                __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+                free(req);
+                return ncclSystemError;
+            } else if (recvd > 0) {
+                // Partial header - wait for more
+                fcntl(comm->sock, F_SETFL, flags);
+                *done = 0;
+                return ncclSuccess;
+            } else {
+                // Error
+                MESH_WARN("TCP test: Failed to receive header: %s", strerror(errno));
+                req->error = errno;
+                req->done = 1;
+                *done = 1;
+                fcntl(comm->sock, F_SETFL, flags);
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);
                 return ncclSystemError;
             }
+        }
 
-            uint32_t msg_size = ntohl(net_size);
-            if (msg_size > req->size) {
-                req->error = EMSGSIZE;
+        // Continue receiving data from where we left off
+        while (req->offset < req->msg_size) {
+            do {
+                recvd = recv(comm->sock, (char *)req->data + req->offset,
+                            req->msg_size - req->offset, 0);
+            } while (recvd < 0 && errno == EINTR);
+
+            if (recvd == 0) {
+                // Connection closed before all data received
+                MESH_WARN("TCP test: Connection closed during data receive");
+                req->error = ECONNRESET;
                 req->done = 1;
                 *done = 1;
+                fcntl(comm->sock, F_SETFL, flags);
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
-                free(req);  // TICKET-8: Free request on error
+                free(req);
+                return ncclSystemError;
+            } else if (recvd < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // No more data available - return for more polling
+                    fcntl(comm->sock, F_SETFL, flags);
+                    *done = 0;
+                    return ncclSuccess;
+                }
+                MESH_WARN("TCP test: Failed to receive data: %s", strerror(errno));
+                req->error = errno;
+                req->done = 1;
+                *done = 1;
+                fcntl(comm->sock, F_SETFL, flags);
+                __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+                free(req);
                 return ncclSystemError;
             }
-
-            // Receive data with timeout to prevent indefinite hangs (TICKET-10)
-            size_t total_recvd = 0;
-            int timeout_retries = 0;
-            int max_timeout_retries = g_mesh_state.timeout_ms * 100;  // 100us per retry
-            while (total_recvd < msg_size) {
-                recvd = recv(comm->sock, (char *)req->data + total_recvd, msg_size - total_recvd, 0);
-                if (recvd <= 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        if (++timeout_retries > max_timeout_retries) {
-                            MESH_WARN("TCP test: Data receive timed out after %d ms", g_mesh_state.timeout_ms);
-                            req->error = ETIMEDOUT;
-                            req->done = 1;
-                            *done = 1;
-                            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-                            __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
-                            free(req);
-                            return ncclSystemError;
-                        }
-                        usleep(100);
-                        continue;
-                    }
-                    req->error = errno;
-                    req->done = 1;
-                    *done = 1;
-                    __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-                    __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
-                    free(req);  // TICKET-8: Free request on recv error
-                    return ncclSystemError;
-                }
-                total_recvd += recvd;
-                timeout_retries = 0;  // Reset timeout on progress
-            }
-
-            req->size = msg_size;
-            req->done = 1;
-            *done = 1;
-            if (sizes) *sizes = msg_size;
-            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-            __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
-            free(req);  // TICKET-8: Free request on success completion
-            return ncclSuccess;
-        } else if (recvd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            // Not ready yet
-            fcntl(comm->sock, F_SETFL, flags);
-            *done = 0;
-            return ncclSuccess;
-        } else {
-            // Error or connection closed
-            fcntl(comm->sock, F_SETFL, flags);
-            req->error = errno ? errno : ECONNRESET;
-            req->done = 1;
-            *done = 1;
-            __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
-            __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
-            free(req);  // TICKET-8: Free request on connection error
-            return ncclSystemError;
+            req->offset += recvd;
         }
+
+        // All data received
+        fcntl(comm->sock, F_SETFL, flags);
+        req->size = req->msg_size;
+        req->done = 1;
+        *done = 1;
+        if (sizes) *sizes = req->msg_size;
+        __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+        free(req);
+        return ncclSuccess;
     }
 
     // TICKET-10: For incomplete send, continue sending data
     if (req->is_send && req->comm) {
         struct mesh_tcp_send_comm *comm = (struct mesh_tcp_send_comm *)req->comm;
+        ssize_t sent;
 
         // Set socket to non-blocking
         int flags = fcntl(comm->sock, F_GETFL, 0);
@@ -1974,7 +2037,10 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         // If header not sent yet, try to send it
         if (!req->header_sent) {
             uint32_t net_size = htonl(req->size);
-            ssize_t sent = send(comm->sock, &net_size, sizeof(net_size), MSG_NOSIGNAL);
+            do {
+                sent = send(comm->sock, &net_size, sizeof(net_size), MSG_NOSIGNAL);
+            } while (sent < 0 && errno == EINTR);
+
             if (sent < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     fcntl(comm->sock, F_SETFL, flags);
@@ -2009,8 +2075,11 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
 
         // Continue sending data from where we left off
         while (req->offset < req->size) {
-            ssize_t sent = send(comm->sock, (char *)req->data + req->offset,
-                               req->size - req->offset, MSG_NOSIGNAL);
+            do {
+                sent = send(comm->sock, (char *)req->data + req->offset,
+                           req->size - req->offset, MSG_NOSIGNAL);
+            } while (sent < 0 && errno == EINTR);
+
             if (sent <= 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     // Socket buffer full - return for more polling

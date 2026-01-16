@@ -3,7 +3,10 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -fPIC -g
 CFLAGS += -I. -I./include
-LDFLAGS = -shared -libverbs -lpthread
+# LDFLAGS for systems with libibverbs
+# LDFLAGS = -shared -libverbs -lpthread
+# LDFLAGS for stub/TCP-only build
+LDFLAGS = -shared -lpthread
 
 # Target
 TARGET = libnccl-net.so
