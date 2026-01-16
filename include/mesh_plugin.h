@@ -260,6 +260,8 @@ struct mesh_tcp_request {
     int error;                  // Error code if failed
     size_t offset;              // TICKET-10: Bytes sent/received so far for async progress
     int header_sent;            // TICKET-10: 1 if size header already sent (send only)
+    int header_recvd;           // TICKET-10: 1 if size header already received (recv only)
+    size_t msg_size;            // TICKET-10: Actual message size from header (recv only)
 };
 
 /*
