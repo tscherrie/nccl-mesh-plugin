@@ -234,6 +234,9 @@ struct mesh_tcp_send_comm {
 
     // Buffer for message framing
     uint8_t send_hdr[8];        // Size header for message framing
+
+    // TICKET-10: Track pending request to prevent overlapping sends
+    struct mesh_tcp_request *pending_req;  // Current in-progress request (NULL if none)
 };
 
 struct mesh_tcp_recv_comm {
@@ -248,6 +251,9 @@ struct mesh_tcp_recv_comm {
 
     // Buffer for message framing
     uint8_t recv_hdr[8];        // Size header for message framing
+
+    // TICKET-10: Track pending request to prevent overlapping reads
+    struct mesh_tcp_request *pending_req;  // Current in-progress request (NULL if none)
 };
 
 struct mesh_tcp_request {

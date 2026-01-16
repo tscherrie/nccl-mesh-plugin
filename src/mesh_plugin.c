@@ -1627,6 +1627,12 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
         return ncclSystemError;
     }
 
+    // TICKET-10: Check for overlapping requests - this would corrupt the byte stream
+    if (comm->pending_req != NULL) {
+        MESH_WARN("TCP isend: Previous request still pending (overlapping isend calls)");
+        return ncclSystemError;
+    }
+
     req = calloc(1, sizeof(*req));
     if (!req) {
         return ncclSystemError;
@@ -1643,6 +1649,9 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
     req->offset = 0;
     req->header_sent = 0;
 
+    // TICKET-10: Mark this request as pending to prevent overlapping operations
+    comm->pending_req = req;
+
     // Set socket to non-blocking for async send
     int flags = fcntl(comm->sock, F_GETFL, 0);
     fcntl(comm->sock, F_SETFL, flags | O_NONBLOCK);
@@ -1650,6 +1659,7 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
     // Try to send size header (4 bytes, network byte order)
     // TICKET-10: Handle EINTR and retry for transient errors
     uint32_t net_size = htonl(size);
+    MESH_DEBUG("TCP isend: sending header size=%d (net_size=0x%08x)", size, net_size);
     ssize_t sent;
     do {
         sent = send(comm->sock, &net_size, sizeof(net_size), MSG_NOSIGNAL);
@@ -1666,6 +1676,7 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
         comm->peer_failed = 1;
         comm->last_errno = errno;
         fcntl(comm->sock, F_SETFL, flags);
+        comm->pending_req = NULL;
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         free(req);
         return ncclSystemError;
@@ -1675,6 +1686,7 @@ static ncclResult_t mesh_tcp_isend(void *sendComm, void *data, int size, int tag
         MESH_WARN("TCP isend: Partial header send (%zd/%zu)", sent, sizeof(net_size));
         comm->peer_failed = 1;
         fcntl(comm->sock, F_SETFL, flags);
+        comm->pending_req = NULL;
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         free(req);
         return ncclSystemError;
@@ -1740,6 +1752,12 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
         return ncclSystemError;
     }
 
+    // TICKET-10: Check for overlapping requests - this would corrupt the byte stream
+    if (comm->pending_req != NULL) {
+        MESH_WARN("TCP irecv: Previous request still pending (overlapping irecv calls)");
+        return ncclSystemError;
+    }
+
     req = calloc(1, sizeof(*req));
     if (!req) {
         return ncclSystemError;
@@ -1756,6 +1774,9 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
     req->offset = 0;
     req->header_recvd = 0;
     req->msg_size = 0;
+
+    // TICKET-10: Mark this request as pending to prevent overlapping operations
+    comm->pending_req = req;
 
     // Set socket to non-blocking for async receive
     int flags = fcntl(comm->sock, F_GETFL, 0);
@@ -1774,6 +1795,7 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
         MESH_WARN("TCP irecv: Connection closed by peer");
         comm->peer_failed = 1;
         fcntl(comm->sock, F_SETFL, flags);
+        comm->pending_req = NULL;
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         free(req);
         return ncclSystemError;
@@ -1794,6 +1816,7 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
         comm->peer_failed = 1;
         comm->last_errno = errno;
         fcntl(comm->sock, F_SETFL, flags);
+        comm->pending_req = NULL;
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         free(req);
         return ncclSystemError;
@@ -1804,20 +1827,28 @@ static ncclResult_t mesh_tcp_irecv(void *recvComm, int n, void **data, int *size
         recvd = recv(comm->sock, &net_size, sizeof(net_size), 0);
     } while (recvd < 0 && errno == EINTR);
 
+    MESH_DEBUG("TCP irecv: received header net_size=0x%08x (raw bytes: %02x %02x %02x %02x)",
+               net_size,
+               ((unsigned char*)&net_size)[0], ((unsigned char*)&net_size)[1],
+               ((unsigned char*)&net_size)[2], ((unsigned char*)&net_size)[3]);
+
     if (recvd != sizeof(net_size)) {
         MESH_WARN("TCP irecv: Failed to consume header: %s", strerror(errno));
         comm->peer_failed = 1;
         comm->last_errno = errno;
         fcntl(comm->sock, F_SETFL, flags);
+        comm->pending_req = NULL;
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         free(req);
         return ncclSystemError;
     }
 
     uint32_t msg_size = ntohl(net_size);
+    MESH_DEBUG("TCP irecv: msg_size=%u (after ntohl), buffer_size=%d", msg_size, sizes[0]);
     if (msg_size > (uint32_t)sizes[0]) {
         MESH_WARN("TCP irecv: Message too large (%u > %d)", msg_size, sizes[0]);
         fcntl(comm->sock, F_SETFL, flags);
+        comm->pending_req = NULL;
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         free(req);
         return ncclSystemError;
@@ -1884,6 +1915,12 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         *done = 1;
         if (sizes) *sizes = req->size;
         ncclResult_t result = req->error ? ncclSystemError : ncclSuccess;
+        // TICKET-10: Clear pending_req before freeing
+        if (req->is_send && req->comm) {
+            ((struct mesh_tcp_send_comm *)req->comm)->pending_req = NULL;
+        } else if (!req->is_send && req->comm) {
+            ((struct mesh_tcp_recv_comm *)req->comm)->pending_req = NULL;
+        }
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
         free(req);  // TICKET-8: Free completed TCP request to prevent memory leak
@@ -1918,6 +1955,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                     req->done = 1;
                     *done = 1;
                     fcntl(comm->sock, F_SETFL, flags);
+                    comm->pending_req = NULL;
                     __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                     __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                     free(req);
@@ -1931,6 +1969,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                     req->done = 1;
                     *done = 1;
                     fcntl(comm->sock, F_SETFL, flags);
+                    comm->pending_req = NULL;
                     __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                     __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                     free(req);
@@ -1952,6 +1991,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 req->done = 1;
                 *done = 1;
                 fcntl(comm->sock, F_SETFL, flags);
+                comm->pending_req = NULL;
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -1968,6 +2008,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 req->done = 1;
                 *done = 1;
                 fcntl(comm->sock, F_SETFL, flags);
+                comm->pending_req = NULL;
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -1989,6 +2030,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 req->done = 1;
                 *done = 1;
                 fcntl(comm->sock, F_SETFL, flags);
+                comm->pending_req = NULL;
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -2005,6 +2047,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 req->done = 1;
                 *done = 1;
                 fcntl(comm->sock, F_SETFL, flags);
+                comm->pending_req = NULL;
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -2019,6 +2062,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         req->done = 1;
         *done = 1;
         if (sizes) *sizes = req->msg_size;
+        comm->pending_req = NULL;
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
         free(req);
@@ -2053,6 +2097,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 req->done = 1;
                 *done = 1;
                 fcntl(comm->sock, F_SETFL, flags);
+                comm->pending_req = NULL;
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -2065,6 +2110,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 req->done = 1;
                 *done = 1;
                 fcntl(comm->sock, F_SETFL, flags);
+                comm->pending_req = NULL;
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -2093,6 +2139,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
                 req->done = 1;
                 *done = 1;
                 fcntl(comm->sock, F_SETFL, flags);
+                comm->pending_req = NULL;
                 __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
                 free(req);
@@ -2106,6 +2153,7 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         req->done = 1;
         *done = 1;
         if (sizes) *sizes = req->size;
+        comm->pending_req = NULL;
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
         free(req);
@@ -2117,6 +2165,12 @@ static ncclResult_t mesh_tcp_test_impl(void *request, int *done, int *sizes) {
         *done = 1;
         if (sizes) *sizes = req->size;
         int had_error = req->error;  // Save before free
+        // TICKET-10: Clear pending_req before freeing
+        if (req->is_send && req->comm) {
+            ((struct mesh_tcp_send_comm *)req->comm)->pending_req = NULL;
+        } else if (!req->is_send && req->comm) {
+            ((struct mesh_tcp_recv_comm *)req->comm)->pending_req = NULL;
+        }
         __atomic_fetch_add(&g_mesh_state.tcp_requests_freed, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
         free(req);  // TICKET-8: Free synchronously completed request
