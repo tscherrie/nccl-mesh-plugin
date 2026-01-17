@@ -191,23 +191,25 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model with DeepSpeed ZeRO-3 init
+    # Get DeepSpeed config
     ds_config = get_ds_config(args)
 
     if args.rank == 0:
         print(f"Loading model from {args.model_path}...")
 
-    # Use DeepSpeed's zero.Init for memory-efficient loading
-    with deepspeed.zero.Init(config_dict_or_path=ds_config):
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_path,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            local_files_only=True,
-            use_cache=False,  # Required for gradient checkpointing
-        )
+    # Load model with memory optimizations
+    # Don't use zero.Init() - it doesn't work well with from_pretrained
+    # Instead, use low_cpu_mem_usage to load shards incrementally
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        local_files_only=True,
+        use_cache=False,  # Required for gradient checkpointing
+        low_cpu_mem_usage=True,  # Load shards incrementally
+    )
 
-    # Enable gradient checkpointing
+    # Enable gradient checkpointing before DeepSpeed init
     model.gradient_checkpointing_enable()
 
     if args.rank == 0:
