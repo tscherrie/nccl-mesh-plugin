@@ -249,9 +249,14 @@ def main():
         print("=" * 60)
         print_memory_stats("Initial ")
 
+    # Verify model path exists (newer huggingface_hub has strict validation)
+    model_path = config["model_id"]
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(f"Model directory not found: {model_path}")
+
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        config["model_id"],
+        model_path,
         trust_remote_code=True,
         local_files_only=True,
     )
@@ -260,7 +265,7 @@ def main():
 
     # Load model with gradient checkpointing
     model = load_model_with_checkpointing(
-        config["model_id"],
+        model_path,
         config["torch_dtype"],
     )
 
