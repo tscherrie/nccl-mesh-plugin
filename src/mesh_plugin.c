@@ -2705,11 +2705,14 @@ static ncclResult_t mesh_regMr(void *comm, void *data, size_t size, int type, vo
 
 static ncclResult_t mesh_regMrDmaBuf(void *comm, void *data, size_t size, int type,
                                     uint64_t offset, int fd, void **mhandle) {
-    // DMA-BUF not implemented yet
+    // DMA-BUF not implemented yet - these params unused
+    (void)offset;
+    (void)fd;
     return mesh_regMr(comm, data, size, type, mhandle);
 }
 
 static ncclResult_t mesh_deregMr(void *comm, void *mhandle) {
+    (void)comm;  // unused - deregistration doesn't need comm
     struct mesh_mr_handle *mrh = (struct mesh_mr_handle *)mhandle;
     
     if (mrh && mrh->mr) {
@@ -2885,7 +2888,12 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
 
 static ncclResult_t mesh_iflush(void *recvComm, int n, void **data, int *sizes,
                                void **mhandles, void **request) {
-    // No flush needed for verbs
+    // No flush needed for verbs - silence unused parameter warnings
+    (void)recvComm;
+    (void)n;
+    (void)data;
+    (void)sizes;
+    (void)mhandles;
     *request = NULL;
     return ncclSuccess;
 }
@@ -3190,11 +3198,16 @@ static ncclResult_t mesh_closeListen(void *listenComm) {
 }
 
 static ncclResult_t mesh_getDeviceMr(void *comm, void *mhandle, void **dptr_mhandle) {
+    (void)comm;
+    (void)mhandle;
     *dptr_mhandle = NULL;
     return ncclSuccess;
 }
 
 static ncclResult_t mesh_irecvConsumed(void *recvComm, int n, void *request) {
+    (void)recvComm;
+    (void)n;
+    (void)request;
     return ncclSuccess;
 }
 
