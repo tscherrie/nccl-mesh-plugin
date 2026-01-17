@@ -4,7 +4,7 @@
 #SBATCH --exclusive
 #SBATCH --output=training_%j.log
 #SBATCH --error=training_%j.log
-#SBATCH --time=72:00:00
+#SBATCH --time=96:00:00
 
 #
 # Qwen2.5-14B Training with DeepSpeed ZeRO-3

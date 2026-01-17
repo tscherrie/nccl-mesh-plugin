@@ -270,16 +270,14 @@ def main():
     start_step = 0
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint == "latest":
-            # Find latest checkpoint
-            if os.path.exists(args.checkpoint_dir):
-                checkpoints = [d for d in os.listdir(args.checkpoint_dir) if d.startswith("step_")]
-                if checkpoints:
-                    latest = max(checkpoints, key=lambda x: int(x.split("_")[1]))
-                    args.resume_from_checkpoint = os.path.join(args.checkpoint_dir, latest)
-                else:
-                    args.resume_from_checkpoint = None
+            # Look for the "latest" checkpoint directory
+            latest_path = os.path.join(args.checkpoint_dir, "latest")
+            if os.path.exists(latest_path):
+                args.resume_from_checkpoint = latest_path
             else:
                 args.resume_from_checkpoint = None
+                if args.rank == 0:
+                    print("No checkpoint found to resume from, starting fresh.", flush=True)
 
         if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
             if args.rank == 0:
@@ -344,19 +342,19 @@ def main():
                       f"Memory: {allocated:.1f}GB/{reserved:.1f}GB", flush=True)
                 total_loss = 0.0
 
-        # Save checkpoint
+        # Save checkpoint (overwrites previous to save disk space)
         if global_step > 0 and global_step % args.save_steps == 0:
-            checkpoint_path = os.path.join(args.checkpoint_dir, f"step_{global_step}")
+            checkpoint_path = os.path.join(args.checkpoint_dir, "latest")
             if args.rank == 0:
-                print(f"Saving checkpoint to {checkpoint_path}...", flush=True)
+                print(f"Saving checkpoint at step {global_step} to {checkpoint_path}...", flush=True)
             model_engine.save_checkpoint(checkpoint_path, client_state={'step': global_step})
             if args.rank == 0:
                 print(f"Checkpoint saved.", flush=True)
 
     # Save final checkpoint
-    final_checkpoint_path = os.path.join(args.checkpoint_dir, f"step_{global_step}_final")
+    final_checkpoint_path = os.path.join(args.checkpoint_dir, "final")
     if args.rank == 0:
-        print(f"Saving final checkpoint to {final_checkpoint_path}...", flush=True)
+        print(f"Saving final checkpoint (step {global_step}) to {final_checkpoint_path}...", flush=True)
     model_engine.save_checkpoint(final_checkpoint_path, client_state={'step': global_step})
 
     if args.rank == 0:
