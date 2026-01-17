@@ -25,6 +25,7 @@ NUM_NODES="${NUM_NODES:-3}"
 
 # NCCL mesh plugin configuration
 export NCCL_NET_PLUGIN=mesh
+export LD_LIBRARY_PATH=/home/titanic/nccl-mesh-plugin:${LD_LIBRARY_PATH:-}
 export NCCL_DEBUG=INFO
 export NCCL_MESH_DEBUG=1
 export NCCL_SOCKET_IFNAME=enP7s7  # Primary mesh interface
