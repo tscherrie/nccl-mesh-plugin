@@ -54,7 +54,7 @@ def get_model_config():
     """Memory-optimized configuration for 32B model on 3x117GB nodes."""
     return {
         # Model
-        "model_id": "/mnt/nas/models/Qwen__Qwen2.5-Coder-32B-Instruct",
+        "model_id": "/home/titanic/models/Qwen__Qwen2.5-Coder-32B-Instruct",
         "torch_dtype": torch.bfloat16,
 
         # Training
