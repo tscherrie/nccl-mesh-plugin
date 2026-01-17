@@ -157,6 +157,10 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to checkpoint to resume from, or 'latest' to auto-detect")
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--deepspeed", type=str, default=None)
     args = parser.parse_args()
@@ -175,6 +179,10 @@ def main():
     torch.cuda.set_device(args.local_rank)
     device = torch.device("cuda", args.local_rank)
 
+    # Create checkpoint directory
+    if args.rank == 0:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+
     if args.rank == 0:
         print("=" * 60)
         print("QWEN-14B TRAINING WITH DEEPSPEED ZERO-3")
@@ -184,6 +192,8 @@ def main():
         print(f"Gradient accumulation: {args.gradient_accumulation_steps}")
         print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps * args.world_size}")
         print(f"Max sequence length: {args.max_seq_length}")
+        print(f"Checkpoint dir: {args.checkpoint_dir}")
+        print(f"Save every: {args.save_steps} steps")
         print("=" * 60)
 
     # Load tokenizer (local_files_only=True for local paths)
@@ -256,15 +266,37 @@ def main():
         model_parameters=model.parameters()
     )
 
+    # Resume from checkpoint if specified
+    start_step = 0
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint == "latest":
+            # Look for the "latest" checkpoint directory
+            latest_path = os.path.join(args.checkpoint_dir, "latest")
+            if os.path.exists(latest_path):
+                args.resume_from_checkpoint = latest_path
+            else:
+                args.resume_from_checkpoint = None
+                if args.rank == 0:
+                    print("No checkpoint found to resume from, starting fresh.", flush=True)
+
+        if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
+            if args.rank == 0:
+                print(f"Resuming from checkpoint: {args.resume_from_checkpoint}", flush=True)
+            _, client_state = model_engine.load_checkpoint(args.resume_from_checkpoint)
+            if client_state and 'step' in client_state:
+                start_step = client_state['step']
+                if args.rank == 0:
+                    print(f"Resumed at step {start_step}", flush=True)
+
     if args.rank == 0:
-        print(f"\nStarting training for {args.max_steps} steps...", flush=True)
+        print(f"\nStarting training for {args.max_steps} steps (from step {start_step})...", flush=True)
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
         print(f"After DeepSpeed init: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved", flush=True)
 
     # Training loop
     model_engine.train()
-    global_step = 0
+    global_step = start_step
     total_loss = 0.0
 
     if args.rank == 0:
@@ -309,6 +341,21 @@ def main():
                 print(f"Step {global_step}/{args.max_steps} | Loss: {avg_loss:.4f} | "
                       f"Memory: {allocated:.1f}GB/{reserved:.1f}GB", flush=True)
                 total_loss = 0.0
+
+        # Save checkpoint (overwrites previous to save disk space)
+        if global_step > 0 and global_step % args.save_steps == 0:
+            checkpoint_path = os.path.join(args.checkpoint_dir, "latest")
+            if args.rank == 0:
+                print(f"Saving checkpoint at step {global_step} to {checkpoint_path}...", flush=True)
+            model_engine.save_checkpoint(checkpoint_path, client_state={'step': global_step})
+            if args.rank == 0:
+                print(f"Checkpoint saved.", flush=True)
+
+    # Save final checkpoint
+    final_checkpoint_path = os.path.join(args.checkpoint_dir, "final")
+    if args.rank == 0:
+        print(f"Saving final checkpoint (step {global_step}) to {final_checkpoint_path}...", flush=True)
+    model_engine.save_checkpoint(final_checkpoint_path, client_state={'step': global_step})
 
     if args.rank == 0:
         print("\nTraining complete!")

@@ -4,15 +4,20 @@
 #SBATCH --exclusive
 #SBATCH --output=training_%j.log
 #SBATCH --error=training_%j.log
-#SBATCH --time=24:00:00
+#SBATCH --time=96:00:00
 
 #
 # Qwen2.5-14B Training with DeepSpeed ZeRO-3
 #
 # Usage:
-#   sbatch submit_training.sbatch                    # Use defaults
-#   sbatch submit_training.sbatch 12000              # Custom steps
-#   sbatch submit_training.sbatch 12000 100 2e-5    # steps, warmup, lr
+#   sbatch submit_training.sbatch                              # Fresh start with defaults
+#   sbatch submit_training.sbatch 12000                        # Custom steps
+#   sbatch submit_training.sbatch 12000 500 latest             # Resume from latest checkpoint
+#
+# Arguments: STEPS SAVE_STEPS RESUME
+#   STEPS      - Total training steps (default: 12000)
+#   SAVE_STEPS - Checkpoint every N steps (default: 500)
+#   RESUME     - 'latest' to auto-resume, or path to checkpoint
 #
 # Monitor:
 #   tail -f training_<jobid>.log
@@ -22,10 +27,10 @@
 #   scancel <jobid>
 #
 
-# Training parameters (can be overridden via positional args)
+# Training parameters
 STEPS=${1:-12000}
-WARMUP=${2:-100}
-LR=${3:-2e-5}
+SAVE_STEPS=${2:-500}
+RESUME=${3:-}
 
 echo "=========================================="
 echo "Qwen2.5-14B Training Job"
@@ -33,18 +38,26 @@ echo "=========================================="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Nodes: $SLURM_JOB_NODELIST"
 echo "Steps: $STEPS"
-echo "Warmup: $WARMUP"
-echo "Learning rate: $LR"
+echo "Save every: $SAVE_STEPS steps"
+if [ -n "$RESUME" ]; then
+    echo "Resume: $RESUME"
+fi
 echo "Started: $(date)"
 echo "=========================================="
 
 cd /home/titanic/nccl-mesh-plugin
 
+# Build resume argument
+RESUME_ARG=""
+if [ -n "$RESUME" ]; then
+    RESUME_ARG="--resume $RESUME"
+fi
+
 # Run the training
 ./examples/run_qwen14b_deepspeed.sh \
     --steps $STEPS \
-    --warmup $WARMUP \
-    --lr $LR
+    --save-steps $SAVE_STEPS \
+    $RESUME_ARG
 
 EXIT_CODE=$?
 

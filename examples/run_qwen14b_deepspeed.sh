@@ -34,6 +34,9 @@ LEARNING_RATE="2e-5"
 MAX_SEQ_LENGTH=512
 BATCH_SIZE=1
 GRAD_ACCUM=16
+CHECKPOINT_DIR="/mnt/nas/checkpoints/qwen14b"
+SAVE_STEPS=500
+RESUME=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -61,17 +64,32 @@ while [[ $# -gt 0 ]]; do
             GRAD_ACCUM="$2"
             shift 2
             ;;
+        --checkpoint-dir)
+            CHECKPOINT_DIR="$2"
+            shift 2
+            ;;
+        --save-steps)
+            SAVE_STEPS="$2"
+            shift 2
+            ;;
+        --resume)
+            RESUME="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --steps N        Maximum training steps (default: 100)"
-            echo "  --warmup N       Warmup steps (default: 100)"
-            echo "  --lr RATE        Learning rate (default: 2e-5)"
-            echo "  --seq-length N   Max sequence length (default: 512)"
-            echo "  --batch-size N   Batch size per GPU (default: 1)"
-            echo "  --grad-accum N   Gradient accumulation steps (default: 16)"
-            echo "  --help           Show this help message"
+            echo "  --steps N          Maximum training steps (default: 100)"
+            echo "  --warmup N         Warmup steps (default: 100)"
+            echo "  --lr RATE          Learning rate (default: 2e-5)"
+            echo "  --seq-length N     Max sequence length (default: 512)"
+            echo "  --batch-size N     Batch size per GPU (default: 1)"
+            echo "  --grad-accum N     Gradient accumulation steps (default: 16)"
+            echo "  --checkpoint-dir   Checkpoint directory (default: /mnt/nas/checkpoints/qwen14b)"
+            echo "  --save-steps N     Save checkpoint every N steps (default: 500)"
+            echo "  --resume PATH      Resume from checkpoint (use 'latest' for auto-detect)"
+            echo "  --help             Show this help message"
             exit 0
             ;;
         *)
@@ -93,6 +111,11 @@ echo "Learning rate: ${LEARNING_RATE}"
 echo "Sequence length: ${MAX_SEQ_LENGTH}"
 echo "Batch size: ${BATCH_SIZE}"
 echo "Grad accumulation: ${GRAD_ACCUM}"
+echo "Checkpoint dir: ${CHECKPOINT_DIR}"
+echo "Save every: ${SAVE_STEPS} steps"
+if [ -n "$RESUME" ]; then
+    echo "Resume from: ${RESUME}"
+fi
 echo "NCCL plugin: mesh"
 echo "=============================================="
 
@@ -131,7 +154,10 @@ if [ -n "$SLURM_JOB_ID" ]; then
                      --learning_rate ${LEARNING_RATE} \
                      --max_seq_length ${MAX_SEQ_LENGTH} \
                      --batch_size ${BATCH_SIZE} \
-                     --gradient_accumulation_steps ${GRAD_ACCUM}"
+                     --gradient_accumulation_steps ${GRAD_ACCUM} \
+                     --checkpoint_dir ${CHECKPOINT_DIR} \
+                     --save_steps ${SAVE_STEPS} \
+                     ${RESUME:+--resume_from_checkpoint ${RESUME}}"
 
     rm -f $HOSTFILE
 else
