@@ -4,38 +4,54 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## 🎯 What This Does
+## Overview
 
-This plugin enables NCCL (NVIDIA Collective Communications Library) to work with **direct-connect mesh topologies** where each node pair is on a different subnet. Standard NCCL plugins assume either:
-- A switched InfiniBand fabric (all nodes on same subnet)
-- TCP/IP networking (slow, high latency)
+This plugin enables NCCL (NVIDIA Collective Communications Library) to work with **direct-connect mesh topologies** where each node pair is on a different subnet. Standard NCCL plugins assume either a switched InfiniBand fabric (all nodes on same subnet) or TCP/IP networking (slow, high latency). Neither works for direct-cabled RDMA meshes. This plugin does.
 
-Neither works for direct-cabled RDMA meshes. This plugin does.
+**Tested configuration**: 3x DGX Spark workstations with 100Gbps direct RDMA links, running distributed LLM training (Qwen2.5-14B) with DeepSpeed ZeRO-3.
 
-## 🔧 The Problem We Solved
+## Quick Start
+
+```bash
+# 1. Build the plugin
+git clone https://github.com/yourusername/nccl-mesh-plugin.git
+cd nccl-mesh-plugin
+make
+
+# 2. Set environment variables
+export NCCL_NET_PLUGIN=$(pwd)/libnccl-net.so
+export NCCL_SOCKET_IFNAME=eth0  # Your management network interface
+
+# 3. Run distributed training (with SLURM)
+salloc -N3 --exclusive ./examples/run_qwen14b_deepspeed.sh --steps 100
+```
+
+See [QUICKSTART.md](QUICKSTART.md) for detailed setup instructions.
+
+## The Problem We Solved
 
 ```
-                    ┌─────────────┐
-                    │   Spark-A   │
-                    │  (titanic)  │
-                    └──────┬──────┘
-           192.168.101.x   │   192.168.100.x
-              (100Gbps)    │      (100Gbps)
-                    ┌──────┴──────┐
-                    │             │
-              ┌─────┴─────┐ ┌─────┴─────┐
-              │  Spark-B  │ │  Spark-C  │
-              │ (iceberg) │ │(carpathia)│
-              └─────┬─────┘ └─────┬─────┘
-                    │             │
-                    └──────┬──────┘
+                    +-----------+
+                    |  Node A   |
+                    | (spark-a) |
+                    +-----+-----+
+           192.168.101.x  |  192.168.100.x
+              (100Gbps)   |     (100Gbps)
+                    +-----+-----+
+                    |           |
+              +-----+-----+ +---+-------+
+              |  Node B   | |  Node C   |
+              | (spark-b) | | (spark-c) |
+              +-----+-----+ +-----+-----+
+                    |             |
+                    +------+------+
                     192.168.102.x
                       (100Gbps)
 ```
 
 **Three DGX Spark workstations** connected in a triangle mesh with direct 100Gbps RDMA cables. Each link is on a **different subnet** - a configuration not covered by standard NCCL network plugins.
 
-## 🚀 Results
+## Performance
 
 | Metric | Value |
 |--------|-------|
@@ -44,37 +60,60 @@ Neither works for direct-cabled RDMA meshes. This plugin does.
 | Topology | 3-node triangle mesh |
 | Link Speed | 100 Gbps per link |
 
-Successfully ran **distributed LLM inference** (Mistral-7B) across all 3 nodes using NCCL over this custom topology.
+## LLM Training Example
 
-## 🏗️ Architecture
+This plugin was developed for distributed LLM training. Here's how to train Qwen2.5-14B across 3 nodes:
 
-### Key Innovations
+### Prerequisites
 
-1. **Multi-Address Handle Exchange**
-   - Each node advertises ALL its subnet IPs in the NCCL handle
-   - Connector searches for reachable addresses by subnet matching
+- PyTorch 2.0+
+- DeepSpeed
+- Transformers
+- FlashAttention 2 (optional, for memory efficiency)
 
-2. **Subnet-Aware NIC Selection**
-   - `connect()` finds the local NIC on the same subnet as the peer
-   - Automatic routing without IP forwarding or bridges
+### Running Training
 
-3. **Background Handshake Thread**
-   - Eliminates deadlock when both ranks call `connect()` simultaneously
-   - TCP-based QP info exchange runs asynchronously
+**Interactive (for testing):**
+```bash
+salloc -N3 --exclusive
+./examples/run_qwen14b_deepspeed.sh --steps 100
+```
 
-4. **Bidirectional QP Exchange**
-   - Each connection creates fresh Queue Pairs on both sides
-   - No QP reuse across multiple NCCL channels
+**Batch job (for full training):**
+```bash
+# Submit with default settings (12000 steps, ~1 epoch)
+sbatch examples/submit_training.sbatch
 
-### RDMA Implementation
+# Or customize: steps, warmup_steps, learning_rate
+sbatch examples/submit_training.sbatch 12000 100 2e-5
 
-- Raw InfiniBand Verbs API (libibverbs)
-- Reliable Connected (RC) Queue Pairs
-- RoCE v2 over Ethernet
+# Monitor
+tail -f training_<jobid>.log
+```
 
-> **Note on Grace Hopper / DGX Spark**: These systems use unified memory where GPU and CPU share the same physical memory pool. There is no GPU↔Host copy overhead—memory registered for RDMA is directly accessible by the GPU.
+### Memory Usage
 
-## 📦 Installation
+With DeepSpeed ZeRO-3 on 3 nodes (117GB unified memory each):
+
+| Component | Per-Node Memory |
+|-----------|-----------------|
+| Sharded parameters | ~9 GB |
+| Sharded optimizer states | ~19 GB |
+| Sharded gradients | ~9 GB |
+| **Total allocated** | **~38 GB** |
+| Reserved (PyTorch cache) | ~42 GB |
+
+Plenty of headroom for larger batch sizes or longer sequences.
+
+### Scaling
+
+| Model Size | Minimum Nodes | Recommended |
+|------------|---------------|-------------|
+| 7-14B | 2 | 3 |
+| 32B | 3 | 4 |
+| 70B | 6 | 8 |
+
+## Installation
 
 ### Prerequisites
 
@@ -94,161 +133,151 @@ cd nccl-mesh-plugin
 make
 ```
 
-### Use
+### Environment Setup
 
 ```bash
-export LD_LIBRARY_PATH=$(pwd):$LD_LIBRARY_PATH
-export NCCL_NET_PLUGIN=mesh
-export NCCL_DEBUG=INFO  # or WARN for less output
+# Required
+export NCCL_NET_PLUGIN=/path/to/libnccl-net.so
+export LD_LIBRARY_PATH=/path/to/nccl-mesh-plugin:$LD_LIBRARY_PATH
+export NCCL_SOCKET_IFNAME=eth0  # Bootstrap interface (management network)
 
-# Run your distributed job
-python your_distributed_script.py
+# Optional
+export NCCL_DEBUG=INFO          # Or WARN for less output
+export NCCL_MESH_GID_INDEX=3    # RoCE GID index (try 0-3 if issues)
 ```
 
-## 🧪 Testing
+## Architecture
 
-### Basic All-Reduce Test
+### Key Innovations
 
-```python
-import torch
-import torch.distributed as dist
-
-dist.init_process_group('nccl', rank=RANK, world_size=3,
-    init_method='tcp://MASTER_IP:29500')
-
-t = torch.ones(1000, device='cuda')
-dist.all_reduce(t)
-print(f'Result: {t[0]}')  # Should print 3.0
-
-dist.destroy_process_group()
-```
-
-### Bandwidth Benchmark
-
-```python
-import torch
-import torch.distributed as dist
-import time
-
-dist.init_process_group('nccl', rank=RANK, world_size=3,
-    init_method='tcp://MASTER_IP:29500')
-
-t = torch.ones(1024*1024*64, device='cuda')  # 256MB
-
-# Warmup
-for _ in range(5):
-    dist.all_reduce(t)
-torch.cuda.synchronize()
-
-# Benchmark
-start = time.time()
-for _ in range(20):
-    dist.all_reduce(t)
-torch.cuda.synchronize()
-elapsed = time.time() - start
-
-print(f'Bandwidth: {(256*20/1024)/elapsed:.2f} GB/s')
-```
-
-## 🔬 How It Works
+1. **Multi-Address Handle Exchange**: Each node advertises ALL its subnet IPs in the NCCL handle
+2. **Subnet-Aware NIC Selection**: `connect()` finds the local NIC on the same subnet as the peer
+3. **Background Handshake Thread**: Eliminates deadlock when both ranks call `connect()` simultaneously
+4. **Bidirectional QP Exchange**: Fresh Queue Pairs created for each connection
 
 ### Connection Flow
 
 ```
 Rank 0 (listen)                    Rank 1 (connect)
-     │                                   │
-     ▼                                   │
- listen()                                │
- ├─ Create QPs on ALL NICs               │
- ├─ Start handshake thread               │
- ├─ Return handle with all IPs           │
-     │                                   │
-     │◄──────── handle exchange ────────►│
-     │                                   │
-     │                                   ▼
-     │                              connect()
-     │                              ├─ Find matching subnet
-     │                              ├─ Create QP on that NIC
-     │                              ├─ TCP handshake ──────────►│
-     │                                   │                      │
-     │◄────────────────────────────────────────── QP info ─────┤
-     │                                   │                      │
-     ▼                                   ▼                      ▼
+     |                                   |
+     v                                   |
+ listen()                                |
+ +- Create QPs on ALL NICs               |
+ +- Start handshake thread               |
+ +- Return handle with all IPs           |
+     |                                   |
+     |<-------- handle exchange -------->|
+     |                                   |
+     |                                   v
+     |                              connect()
+     |                              +- Find matching subnet
+     |                              +- Create QP on that NIC
+     |                              +- TCP handshake ---------->|
+     |                                   |                      |
+     |<------------------------------ QP info -----------------|
+     |                                   |                      |
+     v                                   v                      v
  accept()                           Connect QP            [handshake thread]
- ├─ Get QP from queue               to peer's QP          ├─ Accept TCP
- └─ Return recv_comm                     │                ├─ Create new QP
-                                         │                ├─ Connect QPs
-                                         │                └─ Queue for accept()
-                                         │
-                                    ┌────┴────┐
-                                    │ RDMA OK │
-                                    └─────────┘
+ +- Get QP from queue               to peer's QP          +- Accept TCP
+ +- Return recv_comm                     |                +- Create new QP
+                                         |                +- Connect QPs
+                                         |                +- Queue for accept()
+                                    +----+----+
+                                    | RDMA OK |
+                                    +---------+
 ```
 
-### Subnet Matching
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details.
 
-```c
-// For each peer address in handle
-for (int i = 0; i < handle->num_addrs; i++) {
-    uint32_t peer_ip = handle->addrs[i].ip;
-    
-    // Find local NIC on same subnet
-    for (int j = 0; j < num_nics; j++) {
-        if ((peer_ip & nic[j].netmask) == nic[j].subnet) {
-            // Found matching NIC!
-            selected_nic = &nic[j];
-            break;
-        }
-    }
-}
-```
-
-## ⚙️ Configuration
+## Configuration Reference
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `NCCL_NET_PLUGIN` | - | Set to `mesh` to use this plugin |
-| `NCCL_DEBUG` | `WARN` | Set to `INFO` for detailed logs |
+| `NCCL_NET_PLUGIN` | - | Path to `libnccl-net.so` |
+| `NCCL_SOCKET_IFNAME` | - | Bootstrap network interface |
+| `NCCL_DEBUG` | `WARN` | Log level: `INFO`, `WARN`, `TRACE` |
 | `NCCL_MESH_GID_INDEX` | `3` | RoCE GID index to use |
-| `NCCL_MESH_DEBUG` | `0` | Debug verbosity: 0=off, 1=info, 2=verbose/trace |
-| `NCCL_MESH_TIMEOUT_MS` | `5000` | Connection timeout in milliseconds |
-| `NCCL_MESH_RETRY_COUNT` | `3` | Number of retry attempts for connections |
-| `NCCL_MESH_FAST_FAIL` | `0` | Fast failure detection (reduced retries). Set to `1` if nodes may OOM/crash |
-| `NCCL_MESH_DISABLE_RDMA` | `0` | Force TCP fallback (not yet implemented) |
+| `NCCL_MESH_DEBUG` | `0` | Plugin debug: 0=off, 1=info, 2=verbose |
+| `NCCL_MESH_TIMEOUT_MS` | `5000` | Connection timeout (ms) |
+| `NCCL_MESH_RETRY_COUNT` | `3` | Connection retry attempts |
 
-## 🚧 Current Limitations
+## Project Structure
 
-- **Full mesh required**: Non-adjacent nodes can't communicate yet (no relay routing)
-- **Single channel per port**: Currently uses one PCIe lane per ConnectX-7 port (100Gbps), not both (200Gbps)
-- **Single QP per connection**: No multi-rail aggregation
-- **RoCE v2 only**: No InfiniBand support (Ethernet only)
+```
+nccl-mesh-plugin/
++-- src/mesh_plugin.c          # Main plugin implementation
++-- include/mesh_plugin.h      # Data structures
++-- nccl/                      # NCCL header files (net.h, net_v8.h)
++-- examples/
+|   +-- train_qwen14b_deepspeed.py   # LLM training script
+|   +-- run_qwen14b_deepspeed.sh     # Launcher script
+|   +-- submit_training.sbatch       # SLURM batch submission
+|   +-- test_allreduce.py            # Basic communication test
+|   +-- benchmark_bandwidth.py       # Bandwidth benchmark
++-- docs/
+|   +-- ARCHITECTURE.md        # Deep dive into implementation
+|   +-- SETUP.md               # Hardware setup guide
++-- QUICKSTART.md              # Step-by-step getting started
++-- Makefile
+```
 
-## 🗺️ Roadmap
+## Troubleshooting
 
-### Near-term
-- [ ] **Ring topology support**: Relay routing for non-adjacent nodes (required for 4-node Spark clusters - only 2 NICs per node)
-- [ ] **Dual-channel per port**: Utilize both PCIe 5.0 x4 lanes per ConnectX-7 port for 200Gbps per cable
-- [ ] **Robustness improvements**: Better error handling, recovery, and diagnostics
+### Plugin not loading
 
-### Future
-- [ ] Multi-QP per connection for higher bandwidth
-- [ ] Adaptive routing for partial meshes
-- [ ] Performance tuning (inline data, selective signaling)
+```
+NET/Plugin: Could not find: /path/to/libnccl-net.so
+```
 
-## 📚 References
+- Verify the path is correct on ALL nodes
+- Check file permissions
+- Rebuild with `make clean && make`
 
-- [NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/)
-- [RDMA Aware Networks Programming User Manual](https://www.mellanox.com/related-docs/prod_software/RDMA_Aware_Programming_user_manual.pdf)
-- [InfiniBand Verbs API](https://github.com/linux-rdma/rdma-core)
+### Connection timeout with 192.168.x.x addresses
 
-## 📄 License
+```
+Call to ibv_modify_qp failed with 110 Connection timed out
+local GID ::ffff:192.168.100.1, remote GID ::ffff:192.168.101.3
+```
+
+The mesh plugin didn't load, and NCCL fell back to the built-in IB plugin which uses unroutable addresses. Fix:
+- Ensure `NCCL_NET_PLUGIN` points to the correct path
+- Look for `Loaded net plugin Mesh (v9)` in logs
+
+### GID index issues
+
+Try different values: `export NCCL_MESH_GID_INDEX=0` (or 1, 2, 3)
+
+Check available GIDs:
+```bash
+show_gids
+# or
+cat /sys/class/infiniband/*/ports/1/gids/*
+```
+
+## Limitations
+
+- **Full mesh required**: Non-adjacent nodes can't communicate (no relay routing yet)
+- **Single channel per port**: Uses 100Gbps, not full 200Gbps per ConnectX-7 port
+- **RoCE v2 only**: No InfiniBand fabric support
+
+## Roadmap
+
+- [ ] Ring topology support (for 4+ nodes with only 2 NICs each)
+- [ ] Dual-channel per port (200Gbps)
+- [ ] Multi-QP aggregation
+- [ ] Checkpoint saving in training scripts
+
+## Documentation
+
+- [QUICKSTART.md](QUICKSTART.md) - Get running in 15 minutes
+- [docs/SETUP.md](docs/SETUP.md) - Hardware setup and network configuration
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - Plugin internals and design
+
+## License
 
 MIT License - see [LICENSE](LICENSE) file.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-Built to connect three DGX Spark workstations in ways that go beyond standard configurations. Sometimes the best solutions come from creative engineering.
-
----
-
-*"The future of distributed AI computing is here."* - Mistral-7B, running on this very plugin
+Built to connect DGX Spark workstations in ways that go beyond standard configurations.

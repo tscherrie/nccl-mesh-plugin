@@ -29,14 +29,54 @@ TRAIN_SCRIPT="${SCRIPT_DIR}/train_qwen14b_deepspeed.py"
 
 # Parse arguments
 MAX_STEPS=100
+WARMUP_STEPS=100
+LEARNING_RATE="2e-5"
+MAX_SEQ_LENGTH=512
+BATCH_SIZE=1
+GRAD_ACCUM=16
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --steps)
             MAX_STEPS="$2"
             shift 2
             ;;
+        --warmup)
+            WARMUP_STEPS="$2"
+            shift 2
+            ;;
+        --lr)
+            LEARNING_RATE="$2"
+            shift 2
+            ;;
+        --seq-length)
+            MAX_SEQ_LENGTH="$2"
+            shift 2
+            ;;
+        --batch-size)
+            BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --grad-accum)
+            GRAD_ACCUM="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --steps N        Maximum training steps (default: 100)"
+            echo "  --warmup N       Warmup steps (default: 100)"
+            echo "  --lr RATE        Learning rate (default: 2e-5)"
+            echo "  --seq-length N   Max sequence length (default: 512)"
+            echo "  --batch-size N   Batch size per GPU (default: 1)"
+            echo "  --grad-accum N   Gradient accumulation steps (default: 16)"
+            echo "  --help           Show this help message"
+            exit 0
+            ;;
         *)
             echo "Unknown option: $1"
+            echo "Use --help for usage information"
             exit 1
             ;;
     esac
@@ -48,6 +88,11 @@ echo "=============================================="
 echo "Head node: ${HEAD_NODE}"
 echo "Nodes: ${NODES}"
 echo "Max steps: ${MAX_STEPS}"
+echo "Warmup steps: ${WARMUP_STEPS}"
+echo "Learning rate: ${LEARNING_RATE}"
+echo "Sequence length: ${MAX_SEQ_LENGTH}"
+echo "Batch size: ${BATCH_SIZE}"
+echo "Grad accumulation: ${GRAD_ACCUM}"
 echo "NCCL plugin: mesh"
 echo "=============================================="
 
@@ -82,9 +127,11 @@ if [ -n "$SLURM_JOB_ID" ]; then
                   export LOCAL_RANK=0 && \
                   python ${TRAIN_SCRIPT} \
                      --max_steps ${MAX_STEPS} \
-                     --max_seq_length 512 \
-                     --batch_size 1 \
-                     --gradient_accumulation_steps 16"
+                     --warmup_steps ${WARMUP_STEPS} \
+                     --learning_rate ${LEARNING_RATE} \
+                     --max_seq_length ${MAX_SEQ_LENGTH} \
+                     --batch_size ${BATCH_SIZE} \
+                     --gradient_accumulation_steps ${GRAD_ACCUM}"
 
     rm -f $HOSTFILE
 else
