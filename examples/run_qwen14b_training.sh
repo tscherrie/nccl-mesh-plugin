@@ -18,8 +18,8 @@ HEAD_NODE="${HEAD_NODE:-spark-a}"
 NODES="${NODES:-spark-a,spark-b,spark-c}"
 NUM_NODES="${NUM_NODES:-3}"
 
-# NCCL mesh plugin configuration - use full path for reliable loading
-export NCCL_NET_PLUGIN=/home/titanic/nccl-mesh-plugin/libnccl-net-mesh.so
+# NCCL mesh plugin configuration - use actual .so file, not symlink
+export NCCL_NET_PLUGIN=/home/titanic/nccl-mesh-plugin/libnccl-net.so
 export LD_LIBRARY_PATH=/home/titanic/nccl-mesh-plugin:${LD_LIBRARY_PATH:-}
 export NCCL_DEBUG=INFO
 export NCCL_MESH_DEBUG=1
@@ -72,9 +72,13 @@ if [ -n "$SLURM_JOB_ID" ]; then
          --cpus-per-task=12 \
          --export=ALL \
          bash -c "echo \"[\$(hostname)] Checking mesh plugin...\" && \
-                  ls -la /home/titanic/nccl-mesh-plugin/libnccl-net*.so && \
+                  ls -la /home/titanic/nccl-mesh-plugin/libnccl-net.so && \
+                  echo \"[\$(hostname)] Verifying plugin symbols...\" && \
+                  nm -D /home/titanic/nccl-mesh-plugin/libnccl-net.so 2>/dev/null | grep -E 'ncclNet|ncclCollNet' || echo 'WARNING: No symbols found!' && \
+                  echo \"[\$(hostname)] Checking plugin dependencies...\" && \
+                  ldd /home/titanic/nccl-mesh-plugin/libnccl-net.so | grep -v 'not found' | head -5 && \
                   export LD_LIBRARY_PATH=/home/titanic/nccl-mesh-plugin:\${LD_LIBRARY_PATH:-} && \
-                  export NCCL_NET_PLUGIN=/home/titanic/nccl-mesh-plugin/libnccl-net-mesh.so && \
+                  export NCCL_NET_PLUGIN=/home/titanic/nccl-mesh-plugin/libnccl-net.so && \
                   export NCCL_DEBUG=INFO && \
                   export NCCL_MESH_DEBUG=1 && \
                   export NCCL_SOCKET_IFNAME=enP7s7 && \
