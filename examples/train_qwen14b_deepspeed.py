@@ -52,6 +52,10 @@ class SimpleDataset(Dataset):
                             if 'output' in item:
                                 text += "\n" + item['output']
                             self.samples.append(text)
+                        elif 'question' in item and 'query' in item:
+                            # Text2SQL format: question + query
+                            text = item['question'] + "\n" + item['query']
+                            self.samples.append(text)
                     except json.JSONDecodeError:
                         continue
 
@@ -228,7 +232,7 @@ def main():
         raise ValueError(
             f"No samples loaded from {args.dataset_path}. "
             "Check that the file contains valid JSONL with 'text', 'content', "
-            "'prompt'+'completion', or 'instruction' fields."
+            "'prompt'+'completion', 'instruction', or 'question'+'query' fields."
         )
 
     if args.rank == 0:
