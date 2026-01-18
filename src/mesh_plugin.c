@@ -27,6 +27,7 @@
 
 #include "nccl/net.h"
 #include "mesh_plugin.h"
+#include "mesh_routing.h"
 
 // Global state
 struct mesh_plugin_state g_mesh_state = {0};
@@ -2248,6 +2249,18 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
         mesh_async_connect_init();
     }
 
+    // Initialize routing subsystem (classifies NICs by speed, builds node identity)
+    if (mesh_routing_init() != 0) {
+        MESH_WARN("Routing initialization failed, continuing without topology routing");
+        // Non-fatal - we can still work in direct-connect-only mode
+    }
+
+    // Initialize relay subsystem for non-adjacent node communication
+    if (mesh_relay_init() != 0) {
+        MESH_WARN("Relay initialization failed, relay routing disabled");
+        // Non-fatal - we can still work with direct connections only
+    }
+
     g_mesh_state.initialized = 1;
     MESH_INFO("Mesh plugin initialized with %d NICs (RDMA mode)", g_mesh_state.num_nics);
 
@@ -2271,9 +2284,11 @@ static ncclResult_t mesh_getProperties(int dev, ncclNetProperties_v8_t *props) {
     props->pciPath = nic->pci_path;
     props->guid = 0;  // TODO: Get actual GUID
     props->ptrSupport = NCCL_PTR_HOST;  // Only host memory for now (no GPUDirect RDMA)
-    props->speed = 100000;  // 100 Gbps
+    // Use actual link speed if available, otherwise default to 100 Gbps
+    props->speed = (nic->link_speed_mbps > 0) ? nic->link_speed_mbps : 100000;
     props->port = nic->port_num;
-    props->latency = 1.0;
+    // Latency: fast lane gets lower latency, management gets higher
+    props->latency = (nic->lane == MESH_LANE_FAST) ? 1.0 : 5.0;
     props->maxComms = nic->max_qp;
     props->maxRecvs = 1;
     props->netDeviceType = NCCL_NET_DEVICE_HOST;
@@ -2434,25 +2449,53 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
     }
     
     MESH_INFO("connect: Peer advertised %d addresses", handle->num_addrs);
-    
+
     // Search through peer's addresses to find one we can reach
+    // Priority: Fast lane (100Gbps+) first, then management (10GbE) as fallback
+
+    // Pass 1: Try to find a fast lane connection
     for (int i = 0; i < handle->num_addrs; i++) {
         struct mesh_addr_entry *addr = &handle->addrs[i];
         uint32_t peer_ip = ntohl(addr->ip);
-        
+
         char ip_str[INET_ADDRSTRLEN];
         mesh_uint_to_ip(peer_ip, ip_str, sizeof(ip_str));
-        MESH_DEBUG("connect: Checking peer address %d: %s", i, ip_str);
-        
-        // Find local NIC on same subnet
-        nic = mesh_find_nic_for_ip(peer_ip);
+        MESH_DEBUG("connect: Checking peer address %d for fast lane: %s", i, ip_str);
+
+        // Find fast lane NIC on same subnet
+        nic = mesh_find_fast_nic_for_ip(peer_ip);
         if (nic) {
             selected_addr = addr;
-            MESH_INFO("connect: Found matching NIC %s for peer %s", nic->dev_name, ip_str);
+            MESH_INFO("connect: Found FAST LANE NIC %s (%d Mbps) for peer %s",
+                      nic->dev_name, nic->link_speed_mbps, ip_str);
             break;
         }
     }
-    
+
+    // Pass 2: If no fast lane, try any NIC (including management)
+    if (!nic) {
+        MESH_DEBUG("connect: No fast lane connection available, trying management network");
+        for (int i = 0; i < handle->num_addrs; i++) {
+            struct mesh_addr_entry *addr = &handle->addrs[i];
+            uint32_t peer_ip = ntohl(addr->ip);
+
+            char ip_str[INET_ADDRSTRLEN];
+            mesh_uint_to_ip(peer_ip, ip_str, sizeof(ip_str));
+            MESH_DEBUG("connect: Checking peer address %d for any lane: %s", i, ip_str);
+
+            // Find any NIC on same subnet
+            nic = mesh_find_nic_for_ip(peer_ip);
+            if (nic) {
+                selected_addr = addr;
+                const char *lane_name = mesh_lane_name((enum mesh_nic_lane)nic->lane);
+                MESH_INFO("connect: Found %s NIC %s (%d Mbps) for peer %s",
+                          lane_name, nic->dev_name,
+                          nic->link_speed_mbps > 0 ? nic->link_speed_mbps : 0, ip_str);
+                break;
+            }
+        }
+    }
+
     if (!nic || !selected_addr) {
         MESH_WARN("connect: No local NIC found on same subnet as any peer address");
         for (int i = 0; i < handle->num_addrs; i++) {

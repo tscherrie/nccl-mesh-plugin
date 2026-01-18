@@ -64,6 +64,11 @@ struct mesh_nic {
     uint64_t bytes_sent;
     uint64_t bytes_recv;
     uint64_t connections;
+
+    // Link speed and lane classification (for topology routing)
+    int link_speed_mbps;        // Link speed in Mbps (e.g., 100000 for 100Gbps)
+    int lane;                   // Lane classification (enum mesh_nic_lane from mesh_routing.h)
+                                // 0=unknown, 1=management (10GbE), 2=fast (100Gbps+)
 };
 
 /*
