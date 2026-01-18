@@ -4,12 +4,15 @@ This guide covers setting up a direct-connect RDMA mesh topology with multiple n
 
 ## Overview
 
-Our reference setup uses NVIDIA DGX Spark workstations (Grace Hopper architecture with unified memory) connected via direct RDMA cables. The topology options are:
+Our reference setup uses NVIDIA DGX Spark workstations (Grace Hopper architecture with unified memory) connected via direct RDMA cables. The supported topology options are:
 
-- **3 nodes**: Triangle mesh (fully connected) - current production setup
-- **4 nodes**: Ring topology (each node connects to 2 neighbors) - planned expansion
+- **3 nodes**: Triangle mesh (fully connected) - each node directly connected to all others
+- **4+ nodes ring**: Ring topology - each node connects to 2 neighbors, relay routing for non-adjacent
+- **Any nodes line**: Line topology - chain of nodes, relay routing for multi-hop
 
 Each ConnectX-7 port supports up to **200 Gbps** via dual PCIe 5.0 x4 channels, though current software uses single-channel mode (100 Gbps per link).
+
+**New in v2.0**: The plugin now supports partial mesh topologies with automatic relay routing. Non-adjacent nodes communicate through intermediate relay nodes.
 
 ## Hardware Requirements
 
@@ -224,9 +227,9 @@ Try different GID indices:
 export NCCL_MESH_GID_INDEX=0  # or 1, 2, 3...
 ```
 
-## Scaling to 4 Nodes: Ring Topology
+## Scaling to 4+ Nodes: Ring Topology
 
-Full mesh becomes impractical beyond 3 nodes (N nodes requires N-1 NICs each, N*(N-1)/2 total links). For 4 nodes, we use a **ring topology** instead:
+Full mesh becomes impractical beyond 3 nodes (N nodes requires N-1 NICs each, N*(N-1)/2 total links). For 4+ nodes, we use a **ring topology** with automatic relay routing:
 
 ### Ring Topology (4 Nodes)
 
@@ -265,14 +268,70 @@ Full mesh becomes impractical beyond 3 nodes (N nodes requires N-1 NICs each, N*
 - **Only 2 NICs per node** (vs 3 for full mesh with 4 nodes)
 - **Only 4 links total** (vs 6 for full mesh)
 - **Simpler cabling**: Each node connects to exactly 2 neighbors
+- **Dual-path routing**: Opposite nodes can use either CW or CCW path
+- **Load balancing**: Traffic automatically balanced across paths
 
-### Ring Trade-offs
+### Ring Communication Patterns
 
-- **Non-adjacent communication requires relay**: A↔C and B↔D go through intermediate nodes
-- **Higher latency for non-neighbors**: 2 hops instead of 1
-- **Relay routing required**: Plugin must forward traffic (planned feature)
+| Source | Destination | Hops | Path Options |
+|--------|-------------|------|--------------|
+| A | B | 1 | Direct |
+| A | C | 2 | A→B→C (CW) or A→D→C (CCW) |
+| A | D | 1 | Direct |
+| B | D | 2 | B→A→D (CCW) or B→C→D (CW) |
+
+The plugin automatically:
+1. Detects the ring topology
+2. Computes both CW and CCW paths
+3. Balances load across equal-length paths
+4. Forwards traffic through relay nodes
+
+### Ring Configuration
+
+```bash
+# Enable load balancing (default: on)
+export NCCL_MESH_RING_LOAD_BALANCE=1
+
+# Prefer shorter path always (disable load balancing)
+export NCCL_MESH_RING_PREFER_SHORT=1
+
+# Threshold before switching paths (default: 1MB)
+export NCCL_MESH_RING_BALANCE_THRESHOLD=1048576
+```
 
 > **Note**: Full mesh with 4 nodes would require 3 NICs per node, which isn't possible on DGX Spark (only 2 ConnectX-7 ports per node). Ring topology is the only option for 4-node Spark clusters.
+
+## Line Topology
+
+For scenarios where ring cabling isn't possible, line topology is also supported:
+
+### Line Topology (4 Nodes)
+
+```
+Node A ---- Node B ---- Node C ---- Node D
+  NIC1      NIC1 NIC2   NIC1 NIC2     NIC1
+   |          |    |      |    |        |
+  192.168.100.x   192.168.101.x   192.168.102.x
+```
+
+### Line IP Address Assignment
+
+| Link | Subnet | Node A | Node B | Node C | Node D |
+|------|--------|--------|--------|--------|--------|
+| A↔B | 192.168.100.0/24 | .2 | .3 | - | - |
+| B↔C | 192.168.101.0/24 | - | .2 | .3 | - |
+| C↔D | 192.168.102.0/24 | - | - | .2 | .3 |
+
+### Line Communication Patterns
+
+| Source | Destination | Hops | Path |
+|--------|-------------|------|------|
+| A | B | 1 | Direct |
+| A | C | 2 | A→B→C |
+| A | D | 3 | A→B→C→D |
+| B | D | 2 | B→C→D |
+
+Endpoints (A and D) have only 1 NIC; middle nodes need 2 NICs.
 
 ## Reference: DGX Spark Mesh
 

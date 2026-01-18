@@ -8,6 +8,11 @@
 
 This plugin enables NCCL (NVIDIA Collective Communications Library) to work with **direct-connect mesh topologies** where each node pair is on a different subnet. Standard NCCL plugins assume either a switched InfiniBand fabric (all nodes on same subnet) or TCP/IP networking (slow, high latency). Neither works for direct-cabled RDMA meshes. This plugin does.
 
+**Supported topologies:**
+- **Full mesh** (3 nodes): Every node directly connected to every other
+- **Ring** (4+ nodes): Each node connects to 2 neighbors, relay routing for non-adjacent
+- **Line** (any number): Chain of nodes, relay routing for multi-hop communication
+
 **Tested configuration**: 3x DGX Spark workstations with 100Gbps direct RDMA links, running distributed LLM training (Qwen2.5-14B) with DeepSpeed ZeRO-3.
 
 ## Quick Start
@@ -191,6 +196,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details.
 
 ## Configuration Reference
 
+### Core Settings
+
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `NCCL_NET_PLUGIN` | - | Path to `libnccl-net.so` |
@@ -201,13 +208,31 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details.
 | `NCCL_MESH_TIMEOUT_MS` | `5000` | Connection timeout (ms) |
 | `NCCL_MESH_RETRY_COUNT` | `3` | Connection retry attempts |
 
+### Topology & Routing Settings
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `NCCL_MESH_ENABLE_RELAY` | `1` | Enable relay routing for non-adjacent nodes |
+| `NCCL_MESH_MAX_HOPS` | `4` | Maximum relay hops allowed |
+| `NCCL_MESH_RING_LOAD_BALANCE` | `1` | Enable load balancing across ring paths |
+| `NCCL_MESH_RING_PREFER_SHORT` | `0` | Always prefer shorter path (disable load balance) |
+| `NCCL_MESH_RING_BALANCE_THRESHOLD` | `1048576` | Bytes difference before switching paths (1MB) |
+
 ## Project Structure
 
 ```
 nccl-mesh-plugin/
-+-- src/mesh_plugin.c          # Main plugin implementation
-+-- include/mesh_plugin.h      # Data structures
++-- src/
+|   +-- mesh_plugin.c          # Main plugin implementation
+|   +-- mesh_routing.c         # Topology routing and relay layer
++-- include/
+|   +-- mesh_plugin.h          # Plugin data structures
+|   +-- mesh_routing.h         # Routing data structures
 +-- nccl/                      # NCCL header files (net.h, net_v8.h)
++-- tests/
+|   +-- test_routing.c         # Unit tests for routing
+|   +-- test_ring_topo.py      # Ring topology integration tests
+|   +-- test_line_topo.py      # Line topology integration tests
 +-- examples/
 |   +-- train_qwen14b_deepspeed.py   # LLM training script
 |   +-- run_qwen14b_deepspeed.sh     # Launcher script
@@ -215,8 +240,9 @@ nccl-mesh-plugin/
 |   +-- test_allreduce.py            # Basic communication test
 |   +-- benchmark_bandwidth.py       # Bandwidth benchmark
 +-- docs/
-|   +-- ARCHITECTURE.md        # Deep dive into implementation
-|   +-- SETUP.md               # Hardware setup guide
+|   +-- ARCHITECTURE.md              # Deep dive into implementation
+|   +-- SETUP.md                     # Hardware setup guide
+|   +-- PARTIAL_MESH_ROUTING_PLAN.md # Routing implementation plan
 +-- QUICKSTART.md              # Step-by-step getting started
 +-- Makefile
 ```
@@ -257,13 +283,18 @@ cat /sys/class/infiniband/*/ports/1/gids/*
 
 ## Limitations
 
-- **Full mesh required**: Non-adjacent nodes can't communicate (no relay routing yet)
 - **Single channel per port**: Uses 100Gbps, not full 200Gbps per ConnectX-7 port
 - **RoCE v2 only**: No InfiniBand fabric support
+- **Store-and-forward relay**: Adds latency for multi-hop (cut-through planned)
 
 ## Roadmap
 
-- [ ] Ring topology support (for 4+ nodes with only 2 NICs each)
+- [x] Ring topology support (for 4+ nodes with only 2 NICs each)
+- [x] Line topology support (chain of nodes)
+- [x] Relay routing for non-adjacent nodes
+- [x] Automatic topology detection
+- [x] Dual-path routing with load balancing (ring)
+- [ ] Cut-through forwarding (reduce relay latency)
 - [ ] Dual-channel per port (200Gbps)
 - [ ] Multi-QP aggregation
 - [ ] Checkpoint saving in training scripts

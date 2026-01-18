@@ -280,6 +280,123 @@ ncclResult_t mesh_regMr(void *comm, void *data, size_t size,
 
 **Note on Memory Architecture**: On Grace Hopper / DGX Spark systems with unified memory, GPU and CPU share the same physical memory pool. Memory registered for RDMA is directly accessible by the GPU with no copy overhead. On discrete GPU systems, host memory staging would apply (GPU→Host→RDMA→Host→GPU).
 
+## Topology Routing Layer
+
+The routing layer (`mesh_routing.c`) enables communication in partial mesh topologies where not all nodes are directly connected.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    NCCL Application                          │
+├─────────────────────────────────────────────────────────────┤
+│                   NCCL Framework                             │
+├─────────────────────────────────────────────────────────────┤
+│                 NCCL Net Plugin API                          │
+│  (listen, connect, accept, send, recv, test, close)         │
+├─────────────────────────────────────────────────────────────┤
+│                  Mesh Plugin Router                          │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  Topology Discovery │ Routing Table │ Path Selection │   │
+│  └─────────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────┤
+│               Mesh Plugin Core                               │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │  Subnet-Aware NIC │ QP Management │ Connection Pool  │   │
+│  └─────────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────┤
+│                    RDMA Verbs API                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### NIC Lane Classification
+
+NICs are classified by link speed into two lanes:
+- **Fast Lane** (≥50 Gbps): Used for collective traffic (all-reduce, etc.)
+- **Management Lane** (<50 Gbps): Used for orchestration, checkpoints
+
+```c
+enum mesh_nic_lane {
+    MESH_LANE_UNKNOWN = 0,
+    MESH_LANE_MANAGEMENT,  // 10GbE, 25GbE
+    MESH_LANE_FAST,        // 100GbE, 200GbE
+};
+```
+
+This separation allows 10GbE management networks (all-to-all via switch) to coexist with fast direct-connect links in ring/line topologies.
+
+### Topology Detection
+
+The plugin automatically detects topology based on node degree analysis:
+
+```c
+enum mesh_topology_type {
+    MESH_TOPO_FULL_MESH,  // All nodes directly connected
+    MESH_TOPO_RING,       // Each node has exactly 2 neighbors
+    MESH_TOPO_LINE,       // 2 endpoints (1 neighbor), rest have 2
+    MESH_TOPO_PARTIAL,    // Mixed connectivity
+};
+```
+
+### Routing Table
+
+BFS shortest-path algorithm computes routes to all nodes:
+
+```c
+struct mesh_route_entry {
+    uint32_t dest_node_id;      // Destination
+    uint8_t  num_hops;          // 1 = direct, 2+ = relayed
+    int      is_direct;         // Direct connection available?
+    uint32_t next_hop_node_id;  // First hop for relay
+    uint8_t  relay_path[];      // Full path for multi-hop
+};
+```
+
+### Ring Topology Optimizations
+
+For ring topologies, dual-path routing enables load balancing:
+
+```
+Ring: A - B - C - D - A
+
+A to C: Two paths available
+  - Clockwise:  A → B → C (2 hops)
+  - Counter-CW: A → D → C (2 hops)
+```
+
+The plugin tracks bytes sent on each path and balances load:
+- `NCCL_MESH_RING_LOAD_BALANCE=1`: Enable load balancing (default)
+- `NCCL_MESH_RING_BALANCE_THRESHOLD`: Bytes difference before switching
+
+### Line Topology Optimizations
+
+For line topologies, endpoints and direction are detected:
+
+```
+Line: A - B - C - D
+
+Endpoints: A (head), D (tail)
+Direction from B to D: towards tail (+1)
+Direction from B to A: towards head (-1)
+```
+
+### Relay Communication
+
+Non-adjacent nodes communicate via store-and-forward relay:
+
+```c
+struct mesh_relay_header {
+    uint32_t magic;           // MESH_RELAY_MAGIC
+    uint32_t src_node_id;     // Original sender
+    uint32_t dst_node_id;     // Final destination
+    uint32_t payload_size;    // Data size
+    uint8_t  hop_count;       // Current hop
+    uint8_t  path[];          // Full path
+};
+```
+
+Relay nodes receive data, check the header, and forward to the next hop.
+
 ## Performance Considerations
 
 ### Current Bottlenecks
@@ -287,21 +404,29 @@ ncclResult_t mesh_regMr(void *comm, void *data, size_t size,
 1. **Single Channel per Port**: ConnectX-7 ports have 2x PCIe 5.0 x4 lanes; we currently use only one (100Gbps instead of 200Gbps)
 2. **Single QP**: One Queue Pair per connection limits parallelism
 3. **Completion Signaling**: Every operation signals completion
-4. **Full Mesh Required**: No relay routing for non-adjacent nodes
+4. **Store-and-Forward Relay**: Adds ~1 RTT latency per hop
 
 ### Achieved Performance
 
-- **8+ GB/s** effective bandwidth
+- **8+ GB/s** effective bandwidth (direct connections)
 - **~64%** of 100 Gbps line rate (single channel)
 - Sufficient for distributed ML workloads
 
+### Implemented Optimizations
+
+#### Ring/Line Topology Support
+4+ node clusters without full mesh connectivity:
+- Relay routing through intermediate nodes
+- Store-and-forward with 4MB relay buffers
+- Automatic topology discovery and BFS path selection
+- Dual-path load balancing for ring topologies
+
 ### Planned Improvements
 
-#### Ring Topology Support
-Enable 4+ node clusters without requiring full mesh connectivity:
-- Relay routing through intermediate nodes for non-adjacent communication
-- Store-and-forward or cut-through forwarding
-- Automatic topology discovery and path selection
+#### Cut-Through Forwarding
+Reduce relay latency by forwarding packets as they arrive:
+- Don't wait for complete message before forwarding
+- Pipeline-friendly for large transfers
 
 #### Dual-Channel Per Port (200Gbps)
 ConnectX-7 ports expose two independent PCIe 5.0 x4 lanes:
@@ -319,13 +444,21 @@ ConnectX-7 ports expose two independent PCIe 5.0 x4 lanes:
 ```
 nccl-mesh-plugin/
 ├── src/
-│   └── mesh_plugin.c      # Main implementation (~1400 lines)
+│   ├── mesh_plugin.c      # Main plugin implementation (~3400 lines)
+│   └── mesh_routing.c     # Routing and relay layer (~3100 lines)
 ├── include/
-│   └── mesh_plugin.h      # Data structures and declarations
+│   ├── mesh_plugin.h      # Plugin data structures
+│   └── mesh_routing.h     # Routing data structures
+├── tests/
+│   ├── test_routing.c     # Unit tests for routing (13 tests)
+│   ├── test_ring_topo.py  # Ring topology integration tests
+│   └── test_line_topo.py  # Line topology integration tests
 ├── nccl/
 │   ├── net.h              # NCCL net plugin interface
 │   ├── net_v8.h           # v8 properties structure
 │   └── err.h              # NCCL error codes
+├── docs/
+│   └── PARTIAL_MESH_ROUTING_PLAN.md  # Implementation plan
 └── Makefile
 ```
 
