@@ -295,7 +295,7 @@ cat /sys/class/infiniband/*/ports/1/gids/*
 - [x] Automatic topology detection
 - [x] Dual-path routing with load balancing (ring)
 - [ ] Cut-through forwarding (reduce relay latency)
-- [ ] Dual-channel per port (200Gbps)
+- [x] Dual-channel per port (200Gbps)
 - [ ] Multi-QP aggregation
 - [ ] Checkpoint saving in training scripts
 
