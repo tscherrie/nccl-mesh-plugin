@@ -568,25 +568,47 @@ int mesh_accept_handshake(int listen_sock, struct mesh_qp_info *remote_info, str
     inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
     MESH_INFO("Accepted handshake connection from %s:%d", ip_str, ntohs(addr.sin_port));
     
+    uint8_t remote_count = 0;
+    ssize_t n = recv(conn_sock, &remote_count, sizeof(remote_count), MSG_WAITALL);
+    if (n != sizeof(remote_count) || remote_count == 0 || remote_count > MESH_MAX_CHANNELS) {
+        MESH_WARN("Failed to receive channel count: got %zd bytes", n);
+        close(conn_sock);
+        return -1;
+    }
+
+    if (remote_count != 1) {
+        MESH_WARN("mesh_accept_handshake only supports 1 channel (got %u)", remote_count);
+        close(conn_sock);
+        return -1;
+    }
+
     // Receive remote QP info
-    ssize_t n = recv(conn_sock, remote_info, sizeof(*remote_info), MSG_WAITALL);
+    n = recv(conn_sock, remote_info, sizeof(*remote_info), MSG_WAITALL);
     if (n != sizeof(*remote_info)) {
         MESH_WARN("Failed to receive QP info: got %zd bytes, expected %zu", n, sizeof(*remote_info));
         close(conn_sock);
         return -1;
     }
-    
-    MESH_INFO("Received remote QP info: qp_num=%u, psn=%u", 
+
+    MESH_INFO("Received remote QP info: qp_num=%u, psn=%u",
               ntohl(remote_info->qp_num), ntohl(remote_info->psn));
-    
+
     // Send our QP info back
+    uint8_t local_count = 1;
+    n = send(conn_sock, &local_count, sizeof(local_count), 0);
+    if (n != sizeof(local_count)) {
+        MESH_WARN("Failed to send channel count: sent %zd bytes, expected %zu", n, sizeof(local_count));
+        close(conn_sock);
+        return -1;
+    }
+
     n = send(conn_sock, local_info, sizeof(*local_info), 0);
     if (n != sizeof(*local_info)) {
         MESH_WARN("Failed to send local QP info: sent %zd bytes, expected %zu", n, sizeof(*local_info));
         close(conn_sock);
         return -1;
     }
-    
+
     MESH_INFO("Sent local QP info: qp_num=%u, psn=%u",
               ntohl(local_info->qp_num), ntohl(local_info->psn));
     
@@ -600,7 +622,8 @@ int mesh_accept_handshake(int listen_sock, struct mesh_qp_info *remote_info, str
  * Retry timing controlled by NCCL_MESH_TIMEOUT_MS and NCCL_MESH_RETRY_COUNT
  */
 int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port,
-                        struct mesh_qp_info *local_info, struct mesh_qp_info *remote_info) {
+                        struct mesh_qp_info *local_infos, int local_count,
+                        struct mesh_qp_info *remote_infos, int *remote_count_out) {
     int sock;
     struct sockaddr_in addr;
     int connected = 0;
@@ -678,21 +701,41 @@ int mesh_send_handshake(uint32_t remote_ip, uint16_t remote_port,
     fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
     
     
-    // Send our QP info
-    ssize_t n = send(sock, local_info, sizeof(*local_info), 0);
-    if (n != sizeof(*local_info)) {
-        MESH_WARN("Failed to send QP info: sent %zd bytes, expected %zu", n, sizeof(*local_info));
+    uint8_t local_count_u8 = (uint8_t)local_count;
+    ssize_t n = send(sock, &local_count_u8, sizeof(local_count_u8), 0);
+    if (n != sizeof(local_count_u8)) {
+        MESH_WARN("Failed to send channel count: sent %zd bytes, expected %zu", n, sizeof(local_count_u8));
+        close(sock);
+        return -1;
+    }
+
+    n = send(sock, local_infos, sizeof(*local_infos) * local_count, 0);
+    if (n != (ssize_t)(sizeof(*local_infos) * local_count)) {
+        MESH_WARN("Failed to send QP info: sent %zd bytes, expected %zu",
+                  n, sizeof(*local_infos) * local_count);
         close(sock);
         return -1;
     }
     
-    
-    // Receive remote's QP info (the accept side's NEW QP)
-    n = recv(sock, remote_info, sizeof(*remote_info), MSG_WAITALL);
-    if (n != sizeof(*remote_info)) {
-        MESH_WARN("Failed to receive remote QP info: got %zd bytes, expected %zu", n, sizeof(*remote_info));
+    uint8_t remote_count = 0;
+    n = recv(sock, &remote_count, sizeof(remote_count), MSG_WAITALL);
+    if (n != sizeof(remote_count) || remote_count == 0 || remote_count > MESH_MAX_CHANNELS) {
+        MESH_WARN("Failed to receive remote channel count: got %zd bytes", n);
         close(sock);
         return -1;
+    }
+
+    int remote_count_int = remote_count;
+    n = recv(sock, remote_infos, sizeof(*remote_infos) * remote_count_int, MSG_WAITALL);
+    if (n != (ssize_t)(sizeof(*remote_infos) * remote_count_int)) {
+        MESH_WARN("Failed to receive remote QP info: got %zd bytes, expected %zu",
+                  n, sizeof(*remote_infos) * remote_count_int);
+        close(sock);
+        return -1;
+    }
+
+    if (remote_count_out) {
+        *remote_count_out = remote_count_int;
     }
     
     
@@ -728,91 +771,133 @@ static void *handshake_thread_func(void *arg) {
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
         
-        // Receive remote QP info
-        struct mesh_qp_info remote_info;
-        ssize_t n = recv(conn_sock, &remote_info, sizeof(remote_info), MSG_WAITALL);
-        if (n != sizeof(remote_info)) {
+        uint8_t remote_count = 0;
+        ssize_t n = recv(conn_sock, &remote_count, sizeof(remote_count), MSG_WAITALL);
+        if (n != sizeof(remote_count) || remote_count == 0 || remote_count > MESH_MAX_CHANNELS) {
             close(conn_sock);
             continue;
         }
-        
-        MESH_DEBUG("Handshake thread: received QP %u, nic_idx=%d", ntohl(remote_info.qp_num), remote_info.nic_idx);
+
+        struct mesh_qp_info remote_info[MESH_MAX_CHANNELS];
+        int remote_count_int = remote_count;
+        n = recv(conn_sock, remote_info, sizeof(remote_info[0]) * remote_count_int, MSG_WAITALL);
+        if (n != (ssize_t)(sizeof(remote_info[0]) * remote_count_int)) {
+            close(conn_sock);
+            continue;
+        }
+
+        MESH_DEBUG("Handshake thread: received %d QPs, nic_idx=%d",
+                   remote_count_int, remote_info[0].nic_idx);
 
         // Select NIC based on nic_idx from remote
-        int nic_idx = remote_info.nic_idx;
+        int nic_idx = remote_info[0].nic_idx;
         if (nic_idx >= lcomm->num_qps) nic_idx = 0;
         struct mesh_nic *nic = lcomm->qps[nic_idx].nic;
         
-        // Create new QP for this connection
-        struct ibv_qp *new_qp = NULL;
-        struct ibv_cq *new_cq = NULL;
-        if (mesh_create_qp(nic, &new_qp, &new_cq) != 0) {
+        // Create shared CQ and QPs for this connection
+        struct ibv_cq *shared_cq = NULL;
+        if (mesh_create_cq(nic, &shared_cq) != 0) {
             close(conn_sock);
             continue;
         }
         
-        MESH_DEBUG("Handshake thread: created QP %d on %s", new_qp->qp_num, nic->dev_name);
+        struct ibv_qp *new_qps[MESH_MAX_CHANNELS] = {0};
+        struct mesh_qp_info local_info[MESH_MAX_CHANNELS];
+        memset(local_info, 0, sizeof(local_info));
 
-        // Connect our QP to remote's QP
-        struct mesh_handle connect_handle;
-        memset(&connect_handle, 0, sizeof(connect_handle));
-        connect_handle.qp_num = ntohl(remote_info.qp_num);
-        connect_handle.psn = ntohl(remote_info.psn);
-        connect_handle.port_num = nic->port_num;
-        connect_handle.mtu = nic->active_mtu;  // Use NIC's actual MTU (TICKET-9)
+        int local_count = remote_count_int;
+        for (int ch = 0; ch < local_count; ch++) {
+            if (mesh_create_qp_with_cq(nic, shared_cq, &new_qps[ch]) != 0) {
+                for (int j = 0; j < ch; j++) {
+                    ibv_destroy_qp(new_qps[j]);
+                }
+                ibv_destroy_cq(shared_cq);
+                close(conn_sock);
+                new_qps[0] = NULL;
+                break;
+            }
 
-        // Construct GID from remote IP
-        union ibv_gid remote_gid;
-        memset(&remote_gid, 0, sizeof(remote_gid));
-        remote_gid.raw[10] = 0xff;
-        remote_gid.raw[11] = 0xff;
-        uint32_t remote_ip = remote_info.ip;
-        memcpy(&remote_gid.raw[12], &remote_ip, 4);
-        connect_handle.gid = remote_gid;
-        
-        if (mesh_connect_qp(new_qp, nic, &connect_handle) != 0) {
-            ibv_destroy_qp(new_qp);
-            ibv_destroy_cq(new_cq);
+            struct mesh_handle connect_handle;
+            memset(&connect_handle, 0, sizeof(connect_handle));
+            connect_handle.qp_num = ntohl(remote_info[ch].qp_num);
+            connect_handle.psn = ntohl(remote_info[ch].psn);
+            connect_handle.port_num = nic->port_num;
+            connect_handle.mtu = nic->active_mtu;  // Use NIC's actual MTU (TICKET-9)
+
+            union ibv_gid remote_gid;
+            memset(&remote_gid, 0, sizeof(remote_gid));
+            remote_gid.raw[10] = 0xff;
+            remote_gid.raw[11] = 0xff;
+            uint32_t remote_ip = remote_info[ch].ip;
+            memcpy(&remote_gid.raw[12], &remote_ip, 4);
+            connect_handle.gid = remote_gid;
+
+            if (mesh_connect_qp(new_qps[ch], nic, &connect_handle) != 0) {
+                for (int j = 0; j <= ch; j++) {
+                    if (new_qps[j]) ibv_destroy_qp(new_qps[j]);
+                }
+                ibv_destroy_cq(shared_cq);
+                close(conn_sock);
+                new_qps[0] = NULL;
+                break;
+            }
+
+            local_info[ch].qp_num = htonl(new_qps[ch]->qp_num);
+            local_info[ch].psn = htonl(0);
+            local_info[ch].ip = htonl(nic->ip_addr);
+            local_info[ch].nic_idx = nic_idx;
+            local_info[ch].channel_count = local_count;
+            local_info[ch].channel_idx = ch;
+        }
+
+        if (!new_qps[0]) {
+            continue;
+        }
+
+        uint8_t local_count_u8 = (uint8_t)local_count;
+        n = send(conn_sock, &local_count_u8, sizeof(local_count_u8), 0);
+        if (n != sizeof(local_count_u8)) {
+            for (int ch = 0; ch < local_count; ch++) {
+                ibv_destroy_qp(new_qps[ch]);
+            }
+            ibv_destroy_cq(shared_cq);
             close(conn_sock);
             continue;
         }
-        
-        MESH_DEBUG("Handshake thread: QP connected to remote QP %d", connect_handle.qp_num);
 
-        // Send our QP info back
-        struct mesh_qp_info local_info;
-        memset(&local_info, 0, sizeof(local_info));
-        local_info.qp_num = htonl(new_qp->qp_num);
-        local_info.psn = htonl(0);
-        local_info.ip = htonl(nic->ip_addr);
-        local_info.nic_idx = nic_idx;
-        
-        n = send(conn_sock, &local_info, sizeof(local_info), 0);
+        n = send(conn_sock, local_info, sizeof(local_info[0]) * local_count, 0);
         close(conn_sock);
-        
-        if (n != sizeof(local_info)) {
-            ibv_destroy_qp(new_qp);
-            ibv_destroy_cq(new_cq);
+
+        if (n != (ssize_t)(sizeof(local_info[0]) * local_count)) {
+            for (int ch = 0; ch < local_count; ch++) {
+                ibv_destroy_qp(new_qps[ch]);
+            }
+            ibv_destroy_cq(shared_cq);
             continue;
         }
-        
-        MESH_DEBUG("Handshake thread: sent QP %d back, queueing for accept", new_qp->qp_num);
+
+        MESH_DEBUG("Handshake thread: sent %d QPs back, queueing for accept", local_count);
 
         // Queue this handshake for accept() to consume
         pthread_mutex_lock(&lcomm->queue_mutex);
         int next_tail = (lcomm->queue_tail + 1) % HANDSHAKE_QUEUE_SIZE;
         if (next_tail != lcomm->queue_head) {
             struct handshake_entry *entry = &lcomm->handshake_queue[lcomm->queue_tail];
-            entry->remote_info = remote_info;
-            entry->local_qp = new_qp;
-            entry->local_cq = new_cq;
+            memcpy(entry->remote_info, remote_info, sizeof(remote_info[0]) * local_count);
+            for (int ch = 0; ch < local_count; ch++) {
+                entry->local_qp[ch] = new_qps[ch];
+            }
+            entry->shared_cq = shared_cq;
             entry->nic = nic;
+            entry->num_channels = local_count;
             entry->valid = 1;
             lcomm->queue_tail = next_tail;
             pthread_cond_signal(&lcomm->queue_cond);
         } else {
-            ibv_destroy_qp(new_qp);
-            ibv_destroy_cq(new_cq);
+            for (int ch = 0; ch < local_count; ch++) {
+                ibv_destroy_qp(new_qps[ch]);
+            }
+            ibv_destroy_cq(shared_cq);
         }
         pthread_mutex_unlock(&lcomm->queue_mutex);
     }
@@ -823,19 +908,21 @@ static void *handshake_thread_func(void *arg) {
 /*
  * Create QP and CQ on a NIC
  */
-int mesh_create_qp(struct mesh_nic *nic, struct ibv_qp **qp_out, struct ibv_cq **cq_out) {
-    struct ibv_cq *cq;
-    struct ibv_qp *qp;
-    struct ibv_qp_init_attr qp_init_attr;
-    int err;
-
-    // Create completion queue
-    cq = ibv_create_cq(nic->context, 4096, NULL, NULL, 0);
+int mesh_create_cq(struct mesh_nic *nic, struct ibv_cq **cq_out) {
+    struct ibv_cq *cq = ibv_create_cq(nic->context, 4096, NULL, NULL, 0);
     if (!cq) {
-        err = errno;
+        int err = errno;
         MESH_WARN("Failed to create CQ on %s: errno=%d (%s)", nic->dev_name, err, strerror(err));
         return -1;
     }
+    *cq_out = cq;
+    return 0;
+}
+
+int mesh_create_qp_with_cq(struct mesh_nic *nic, struct ibv_cq *cq, struct ibv_qp **qp_out) {
+    struct ibv_qp *qp;
+    struct ibv_qp_init_attr qp_init_attr;
+    int err;
 
     // Create queue pair
     memset(&qp_init_attr, 0, sizeof(qp_init_attr));
@@ -852,7 +939,6 @@ int mesh_create_qp(struct mesh_nic *nic, struct ibv_qp **qp_out, struct ibv_cq *
     if (!qp) {
         err = errno;
         MESH_WARN("Failed to create QP on %s: errno=%d (%s)", nic->dev_name, err, strerror(err));
-        ibv_destroy_cq(cq);
         return -1;
     }
 
@@ -868,11 +954,24 @@ int mesh_create_qp(struct mesh_nic *nic, struct ibv_qp **qp_out, struct ibv_cq *
         err = errno;
         MESH_WARN("Failed to transition QP to INIT on %s: errno=%d (%s)", nic->dev_name, err, strerror(err));
         ibv_destroy_qp(qp);
-        ibv_destroy_cq(cq);
         return -1;
     }
 
     *qp_out = qp;
+    return 0;
+}
+
+int mesh_create_qp(struct mesh_nic *nic, struct ibv_qp **qp_out, struct ibv_cq **cq_out) {
+    struct ibv_cq *cq = NULL;
+    if (mesh_create_cq(nic, &cq) != 0) {
+        return -1;
+    }
+
+    if (mesh_create_qp_with_cq(nic, cq, qp_out) != 0) {
+        ibv_destroy_cq(cq);
+        return -1;
+    }
+
     *cq_out = cq;
     return 0;
 }
@@ -1247,22 +1346,25 @@ static void *async_connect_thread_func(void *arg) {
             }
 
             // Do handshake
-            struct mesh_qp_info local_info, remote_info;
-            memset(&local_info, 0, sizeof(local_info));
-            local_info.qp_num = htonl(req->qp->qp_num);
-            local_info.psn = htonl(0);
-            local_info.ip = htonl(req->nic->ip_addr);
-            local_info.gid_index = req->nic->gid_index;
-            local_info.nic_idx = req->selected_addr->nic_idx;
+            struct mesh_qp_info local_info[1], remote_info[1];
+            memset(local_info, 0, sizeof(local_info));
+            local_info[0].qp_num = htonl(req->qp->qp_num);
+            local_info[0].psn = htonl(0);
+            local_info[0].ip = htonl(req->nic->ip_addr);
+            local_info[0].gid_index = req->nic->gid_index;
+            local_info[0].nic_idx = req->selected_addr->nic_idx;
+            local_info[0].channel_count = 1;
+            local_info[0].channel_idx = 0;
 
             union ibv_gid our_gid;
             if (mesh_get_gid(req->nic, &our_gid) == 0) {
-                memcpy(local_info.gid, our_gid.raw, 16);
+                memcpy(local_info[0].gid, our_gid.raw, 16);
             }
 
             uint32_t handshake_ip = ntohl(req->selected_addr->ip);
+            int remote_count = 0;
             if (mesh_send_handshake(handshake_ip, req->handle.handshake_port,
-                                    &local_info, &remote_info) != 0) {
+                                    local_info, 1, remote_info, &remote_count) != 0) {
                 req->error = 1;
                 req->complete = 1;
                 ibv_destroy_qp(req->qp);
@@ -1278,8 +1380,8 @@ static void *async_connect_thread_func(void *arg) {
             // Connect QP
             struct mesh_handle connect_handle;
             memset(&connect_handle, 0, sizeof(connect_handle));
-            connect_handle.qp_num = ntohl(remote_info.qp_num);
-            connect_handle.psn = ntohl(remote_info.psn);
+            connect_handle.qp_num = ntohl(remote_info[0].qp_num);
+            connect_handle.psn = ntohl(remote_info[0].psn);
             connect_handle.port_num = req->nic->port_num;
             connect_handle.mtu = req->nic->active_mtu;  // Use NIC's actual MTU (TICKET-9)
 
@@ -1288,7 +1390,7 @@ static void *async_connect_thread_func(void *arg) {
             memset(&peer_gid, 0, sizeof(peer_gid));
             peer_gid.raw[10] = 0xff;
             peer_gid.raw[11] = 0xff;
-            uint32_t remote_ip_for_gid = remote_info.ip ? remote_info.ip : req->selected_addr->ip;
+            uint32_t remote_ip_for_gid = remote_info[0].ip ? remote_info[0].ip : req->selected_addr->ip;
             memcpy(&peer_gid.raw[12], &remote_ip_for_gid, 4);
             connect_handle.gid = peer_gid;
 
@@ -2352,12 +2454,31 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     env_val = getenv("NCCL_MESH_ASYNC_CONNECT");
     g_mesh_state.enable_async_connect = env_val ? atoi(env_val) : 1;
 
+    // NCCL_MESH_DUAL_CHANNEL: Enable dual-channel QPs (default: 0)
+    env_val = getenv("NCCL_MESH_DUAL_CHANNEL");
+    g_mesh_state.enable_dual_channel = env_val ? atoi(env_val) : 0;
+
+    // NCCL_MESH_DUAL_CHANNEL_STRIPE_BYTES: Minimum size to stripe across channels (default: 1MB)
+    env_val = getenv("NCCL_MESH_DUAL_CHANNEL_STRIPE_BYTES");
+    g_mesh_state.dual_channel_threshold = env_val ? (size_t)atoll(env_val) : (1 << 20);
+    if (g_mesh_state.dual_channel_threshold < 1024) g_mesh_state.dual_channel_threshold = 1024;
+
     // Log configuration (always shown at init, regardless of debug level)
     MESH_LOG(NCCL_LOG_INFO, "MESH Initializing: gid=%d debug=%d fast_fail=%d timeout=%dms retries=%d "
-             "disable_rdma=%d conn_pool=%d async_connect=%d",
+             "disable_rdma=%d conn_pool=%d async_connect=%d dual_channel=%d stripe_bytes=%zu",
              g_mesh_state.gid_index, g_mesh_state.debug_level, g_mesh_state.fast_fail,
              g_mesh_state.timeout_ms, g_mesh_state.retry_count, g_mesh_state.disable_rdma,
-             g_mesh_state.enable_conn_pool, g_mesh_state.enable_async_connect);
+             g_mesh_state.enable_conn_pool, g_mesh_state.enable_async_connect,
+             g_mesh_state.enable_dual_channel, g_mesh_state.dual_channel_threshold);
+
+    if (g_mesh_state.enable_dual_channel && g_mesh_state.enable_conn_pool) {
+        MESH_INFO("Dual-channel enabled: disabling connection pool reuse");
+        g_mesh_state.enable_conn_pool = 0;
+    }
+    if (g_mesh_state.enable_dual_channel && g_mesh_state.enable_async_connect) {
+        MESH_INFO("Dual-channel enabled: disabling async connect");
+        g_mesh_state.enable_async_connect = 0;
+    }
 
     // Verify handle struct size fits in NCCL limits (NCCL_NET_HANDLE_MAXSIZE = 128)
     MESH_LOG(NCCL_LOG_INFO, "MESH Handle size: %zu bytes (max 128)", sizeof(struct mesh_handle));
@@ -2533,6 +2654,7 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     h->num_addrs = 0;
     h->psn = comm->psn;
     h->port_num = 1;
+    h->num_channels = g_mesh_state.enable_dual_channel ? MESH_MAX_CHANNELS : 1;
     h->mtu = comm->qps[0].nic->active_mtu;  // Use NIC's actual MTU (TICKET-9)
     h->handshake_port = comm->handshake_port;
     // Store first NIC IP in handle - but connector will use selected_addr->ip for handshake
@@ -2673,53 +2795,72 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
 
     comm->nic = nic;
     comm->peer_ip = peer_ip;
+    comm->num_channels = g_mesh_state.enable_dual_channel ? MESH_MAX_CHANNELS : 1;
+    comm->next_channel = 0;
 
     // TICKET-6: Check connection pool for existing connection to this peer
-    if (g_mesh_state.enable_conn_pool) {
+    if (g_mesh_state.enable_conn_pool && comm->num_channels == 1) {
         struct mesh_conn_pool_entry *pool_entry = mesh_conn_pool_acquire(peer_ip, nic);
         if (pool_entry) {
             // Pool hit - reuse existing connection
-            comm->qp = pool_entry->qp;
-            comm->cq = pool_entry->cq;
+            comm->qps[0] = pool_entry->qp;
+            comm->shared_cq = pool_entry->cq;
             comm->pool_entry = pool_entry;
-            comm->remote_qp_num = pool_entry->remote_qp_num;
+            comm->remote_qp_num[0] = pool_entry->remote_qp_num;
             comm->connected = 1;
 
             MESH_INFO("connect: Pool hit - reusing connection to %s (QP %d -> %d)",
-                      peer_ip_str, comm->qp->qp_num, comm->remote_qp_num);
+                      peer_ip_str, comm->qps[0]->qp_num, comm->remote_qp_num[0]);
 
             *sendComm = comm;
             if (sendDevComm) *sendDevComm = NULL;
             return ncclSuccess;
         }
         MESH_DEBUG("connect: Pool miss for %s, creating new connection", peer_ip_str);
+    } else if (g_mesh_state.enable_conn_pool && comm->num_channels > 1) {
+        MESH_INFO("connect: Dual-channel enabled; skipping connection pool reuse");
     }
 
-    // Create QP on the selected NIC
-    if (mesh_create_qp(nic, &comm->qp, &comm->cq) != 0) {
+    // Create shared CQ and QPs on the selected NIC
+    if (mesh_create_cq(nic, &comm->shared_cq) != 0) {
         free(comm);
         return ncclSystemError;
     }
 
+    for (int ch = 0; ch < comm->num_channels; ch++) {
+        if (mesh_create_qp_with_cq(nic, comm->shared_cq, &comm->qps[ch]) != 0) {
+            for (int j = 0; j < ch; j++) {
+                ibv_destroy_qp(comm->qps[j]);
+            }
+            ibv_destroy_cq(comm->shared_cq);
+            free(comm);
+            return ncclSystemError;
+        }
+    }
 
     // Do handshake FIRST to get accept's QP number
-    struct mesh_qp_info remote_qp_info;
-    memset(&remote_qp_info, 0, sizeof(remote_qp_info));
+    struct mesh_qp_info remote_qp_info[MESH_MAX_CHANNELS];
+    memset(remote_qp_info, 0, sizeof(remote_qp_info));
+    int remote_count = 0;
 
     if (handle->handshake_port > 0) {
 
-        struct mesh_qp_info local_info;
-        memset(&local_info, 0, sizeof(local_info));
-        local_info.qp_num = htonl(comm->qp->qp_num);
-        local_info.psn = htonl(0);  // Our PSN
-        local_info.ip = htonl(nic->ip_addr);
-        local_info.gid_index = nic->gid_index;
-        local_info.nic_idx = selected_addr->nic_idx;  // Which of listener's NICs we want
+        struct mesh_qp_info local_info[MESH_MAX_CHANNELS];
+        memset(local_info, 0, sizeof(local_info));
+        for (int ch = 0; ch < comm->num_channels; ch++) {
+            local_info[ch].qp_num = htonl(comm->qps[ch]->qp_num);
+            local_info[ch].psn = htonl(0);  // Our PSN
+            local_info[ch].ip = htonl(nic->ip_addr);
+            local_info[ch].gid_index = nic->gid_index;
+            local_info[ch].nic_idx = selected_addr->nic_idx;  // Which of listener's NICs we want
+            local_info[ch].channel_count = comm->num_channels;
+            local_info[ch].channel_idx = ch;
 
-        // Copy our GID (TICKET-5: use cached GID)
-        union ibv_gid our_gid;
-        if (mesh_get_gid(nic, &our_gid) == 0) {
-            memcpy(local_info.gid, our_gid.raw, 16);
+            // Copy our GID (TICKET-5: use cached GID)
+            union ibv_gid our_gid;
+            if (mesh_get_gid(nic, &our_gid) == 0) {
+                memcpy(local_info[ch].gid, our_gid.raw, 16);
+            }
         }
 
         // Bidirectional handshake - send our info, receive accept's info
@@ -2728,10 +2869,13 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         char hs_ip_str[INET_ADDRSTRLEN];
         mesh_uint_to_ip(handshake_ip, hs_ip_str, sizeof(hs_ip_str));
 
-        if (mesh_send_handshake(handshake_ip, handle->handshake_port, &local_info, &remote_qp_info) != 0) {
+        if (mesh_send_handshake(handshake_ip, handle->handshake_port, local_info, comm->num_channels,
+                                remote_qp_info, &remote_count) != 0) {
             MESH_WARN("connect: Bidirectional handshake failed");
-            ibv_destroy_qp(comm->qp);
-            ibv_destroy_cq(comm->cq);
+            for (int ch = 0; ch < comm->num_channels; ch++) {
+                ibv_destroy_qp(comm->qps[ch]);
+            }
+            ibv_destroy_cq(comm->shared_cq);
             free(comm);
             return ncclSystemError;
         }
@@ -2743,57 +2887,81 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
 
     } else {
         MESH_WARN("connect: No handshake port - using listen QP (will likely fail)");
-        remote_qp_info.qp_num = htonl(selected_addr->qp_num);
-        remote_qp_info.psn = htonl(handle->psn);
-        remote_qp_info.ip = selected_addr->ip;
+        remote_qp_info[0].qp_num = htonl(selected_addr->qp_num);
+        remote_qp_info[0].psn = htonl(handle->psn);
+        remote_qp_info[0].ip = selected_addr->ip;
+        remote_count = 1;
     }
 
-    // Now connect our QP to the ACCEPT's QP (from handshake response)
-    struct mesh_handle connect_handle;
-    memset(&connect_handle, 0, sizeof(connect_handle));
-    connect_handle.qp_num = ntohl(remote_qp_info.qp_num);  // Accept's new QP!
-    connect_handle.psn = ntohl(remote_qp_info.psn);
-    connect_handle.lid = 0;  // RoCE uses GID, not LID
-    connect_handle.port_num = nic->port_num;
-    // Negotiate MTU: use minimum of local and remote (TICKET-9)
-    connect_handle.mtu = (handle->mtu && handle->mtu < nic->active_mtu)
-                         ? handle->mtu : nic->active_mtu;
-
-    // Construct peer GID from their IP
-    union ibv_gid peer_gid;
-    memset(&peer_gid, 0, sizeof(peer_gid));
-    peer_gid.raw[10] = 0xff;
-    peer_gid.raw[11] = 0xff;
-    uint32_t remote_ip_for_gid = remote_qp_info.ip;  // Already in network byte order from handshake
-    if (remote_ip_for_gid == 0) {
-        remote_ip_for_gid = selected_addr->ip;  // Fallback
-    }
-    memcpy(&peer_gid.raw[12], &remote_ip_for_gid, 4);
-    connect_handle.gid = peer_gid;
-
-
-    // Connect QP to remote
-    if (mesh_connect_qp(comm->qp, nic, &connect_handle) != 0) {
-        MESH_WARN("connect: Failed to connect QP to peer");
-        ibv_destroy_qp(comm->qp);
-        ibv_destroy_cq(comm->cq);
+    if (remote_count < 1) {
+        MESH_WARN("connect: Invalid remote channel count");
+        for (int ch = 0; ch < comm->num_channels; ch++) {
+            ibv_destroy_qp(comm->qps[ch]);
+        }
+        ibv_destroy_cq(comm->shared_cq);
         free(comm);
         return ncclSystemError;
     }
 
+    if (remote_count < comm->num_channels) {
+        MESH_INFO("connect: Remote supports %d channel(s), local %d; using %d",
+                  remote_count, comm->num_channels, remote_count);
+        for (int ch = remote_count; ch < comm->num_channels; ch++) {
+            ibv_destroy_qp(comm->qps[ch]);
+            comm->qps[ch] = NULL;
+        }
+        comm->num_channels = remote_count;
+    }
+
+    for (int ch = 0; ch < comm->num_channels; ch++) {
+        struct mesh_handle connect_handle;
+        memset(&connect_handle, 0, sizeof(connect_handle));
+        connect_handle.qp_num = ntohl(remote_qp_info[ch].qp_num);  // Accept's new QP!
+        connect_handle.psn = ntohl(remote_qp_info[ch].psn);
+        connect_handle.lid = 0;  // RoCE uses GID, not LID
+        connect_handle.port_num = nic->port_num;
+        // Negotiate MTU: use minimum of local and remote (TICKET-9)
+        connect_handle.mtu = (handle->mtu && handle->mtu < nic->active_mtu)
+                             ? handle->mtu : nic->active_mtu;
+
+        // Construct peer GID from their IP
+        union ibv_gid peer_gid;
+        memset(&peer_gid, 0, sizeof(peer_gid));
+        peer_gid.raw[10] = 0xff;
+        peer_gid.raw[11] = 0xff;
+        uint32_t remote_ip_for_gid = remote_qp_info[ch].ip;  // Already in network byte order from handshake
+        if (remote_ip_for_gid == 0) {
+            remote_ip_for_gid = selected_addr->ip;  // Fallback
+        }
+        memcpy(&peer_gid.raw[12], &remote_ip_for_gid, 4);
+        connect_handle.gid = peer_gid;
+
+        // Connect QP to remote
+        if (mesh_connect_qp(comm->qps[ch], nic, &connect_handle) != 0) {
+            MESH_WARN("connect: Failed to connect QP channel %d to peer", ch);
+            for (int j = 0; j < comm->num_channels; j++) {
+                if (comm->qps[j]) ibv_destroy_qp(comm->qps[j]);
+            }
+            ibv_destroy_cq(comm->shared_cq);
+            free(comm);
+            return ncclSystemError;
+        }
+
+        comm->remote_qp_num[ch] = connect_handle.qp_num;
+    }
+
     comm->connected = 1;
-    comm->remote_qp_num = connect_handle.qp_num;
 
     // TICKET-6: Add new connection to pool
-    if (g_mesh_state.enable_conn_pool) {
-        if (mesh_conn_pool_add(peer_ip, nic, comm->qp, comm->cq, comm->remote_qp_num) == 0) {
+    if (g_mesh_state.enable_conn_pool && comm->num_channels == 1) {
+        if (mesh_conn_pool_add(peer_ip, nic, comm->qps[0], comm->shared_cq, comm->remote_qp_num[0]) == 0) {
             // Find the entry we just added
             comm->pool_entry = mesh_conn_pool_find(peer_ip, nic);
         }
     }
 
-    MESH_INFO("connect: Connected to peer %s via NIC %s (local QP %d -> remote QP %d)",
-              peer_ip_str, nic->dev_name, comm->qp->qp_num, connect_handle.qp_num);
+    MESH_INFO("connect: Connected to peer %s via NIC %s (%d channel(s))",
+              peer_ip_str, nic->dev_name, comm->num_channels);
 
 
     *sendComm = comm;
@@ -2843,8 +3011,12 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
     lcomm->queue_head = (lcomm->queue_head + 1) % HANDSHAKE_QUEUE_SIZE;
     
     // Copy data out
-    rcomm->qp = entry->local_qp;
-    rcomm->cq = entry->local_cq;
+    rcomm->num_channels = entry->num_channels;
+    for (int ch = 0; ch < rcomm->num_channels; ch++) {
+        rcomm->qps[ch] = entry->local_qp[ch];
+        rcomm->remote_qp_num[ch] = ntohl(entry->remote_info[ch].qp_num);
+    }
+    rcomm->shared_cq = entry->shared_cq;
     rcomm->nic = entry->nic;
     entry->valid = 0;
     
@@ -2853,7 +3025,12 @@ static ncclResult_t mesh_accept(void *listenComm, void **recvComm,
     
     rcomm->connected = 1;
     
-    MESH_INFO("accept: Ready on %s (QP %d)", rcomm->nic->dev_name, rcomm->qp->qp_num);
+    if (rcomm->num_channels > 0 && rcomm->qps[0]) {
+        MESH_INFO("accept: Ready on %s (%d channel(s), QP %d)", rcomm->nic->dev_name,
+                  rcomm->num_channels, rcomm->qps[0]->qp_num);
+    } else {
+        MESH_INFO("accept: Ready on %s (%d channel(s))", rcomm->nic->dev_name, rcomm->num_channels);
+    }
     
     *recvComm = rcomm;
     if (recvDevComm) *recvDevComm = NULL;
@@ -2921,6 +3098,23 @@ static ncclResult_t mesh_deregMr(void *comm, void *mhandle) {
     return ncclSuccess;
 }
 
+static int mesh_should_split(size_t size, int num_channels, size_t *first_size) {
+    if (num_channels < 2) {
+        return 0;
+    }
+    if (size < g_mesh_state.dual_channel_threshold) {
+        return 0;
+    }
+    size_t half = size / 2;
+    if (half == 0) {
+        return 0;
+    }
+    if (first_size) {
+        *first_size = half;
+    }
+    return 1;
+}
+
 static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
                               void *mhandle, void **request) {
     // Dispatch to TCP if in fallback mode (TICKET-4)
@@ -2938,7 +3132,7 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
 
     MESH_DEBUG("isend: comm=%p, data=%p, size=%d", (void*)comm, data, size);
 
-    if (!comm || !comm->qp) {
+    if (!comm || comm->num_channels < 1 || !comm->qps[0]) {
         MESH_WARN("isend: invalid comm");
         return ncclSystemError;
     }
@@ -2962,31 +3156,78 @@ static ncclResult_t mesh_isend(void *sendComm, void *data, int size, int tag,
 
     req->used = 1;
     req->size = size;
-    req->cq = comm->cq;  // Store CQ for polling
+    req->cq = comm->shared_cq;  // Store CQ for polling
     req->done = 0;
     req->comm = comm;    // Track comm for error propagation
     req->is_send = 1;
+    req->expected_completions = 1;
+    req->completed_count = 0;
+    req->has_error = 0;
+    req->error_status = IBV_WC_SUCCESS;
 
-    // Setup scatter/gather entry
-    sge.addr = (uintptr_t)data;
-    sge.length = size;
-    sge.lkey = mrh->mr->lkey;
+    size_t first_size = 0;
+    int do_split = mesh_should_split((size_t)size, comm->num_channels, &first_size);
+    if (do_split) {
+        req->expected_completions = 2;
+        size_t second_size = (size_t)size - first_size;
 
-    // Setup send work request
-    memset(&wr, 0, sizeof(wr));
-    wr.wr_id = (uintptr_t)req;
-    wr.next = NULL;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    wr.opcode = IBV_WR_SEND;
-    wr.send_flags = IBV_SEND_SIGNALED;
+        sge.addr = (uintptr_t)data;
+        sge.length = (uint32_t)first_size;
+        sge.lkey = mrh->mr->lkey;
 
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id = (uintptr_t)req;
+        wr.next = NULL;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.opcode = IBV_WR_SEND;
+        wr.send_flags = IBV_SEND_SIGNALED;
 
-    if (ibv_post_send(comm->qp, &wr, &bad_wr)) {
-        MESH_WARN("Failed to post send: %s", strerror(errno));
-        __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
-        free(req);
-        return ncclSystemError;
+        if (ibv_post_send(comm->qps[0], &wr, &bad_wr)) {
+            MESH_WARN("Failed to post send on channel 0: %s", strerror(errno));
+            __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+            free(req);
+            return ncclSystemError;
+        }
+
+        sge.addr = (uintptr_t)((char *)data + first_size);
+        sge.length = (uint32_t)second_size;
+        sge.lkey = mrh->mr->lkey;
+
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id = (uintptr_t)req;
+        wr.next = NULL;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.opcode = IBV_WR_SEND;
+        wr.send_flags = IBV_SEND_SIGNALED;
+
+        if (ibv_post_send(comm->qps[1], &wr, &bad_wr)) {
+            MESH_WARN("Failed to post send on channel 1: %s", strerror(errno));
+            __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+            free(req);
+            return ncclSystemError;
+        }
+    } else {
+        int channel = 0;
+        sge.addr = (uintptr_t)data;
+        sge.length = size;
+        sge.lkey = mrh->mr->lkey;
+
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id = (uintptr_t)req;
+        wr.next = NULL;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.opcode = IBV_WR_SEND;
+        wr.send_flags = IBV_SEND_SIGNALED;
+
+        if (ibv_post_send(comm->qps[channel], &wr, &bad_wr)) {
+            MESH_WARN("Failed to post send: %s", strerror(errno));
+            __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+            free(req);
+            return ncclSystemError;
+        }
     }
 
     // TICKET-9: Track request in comm for cleanup on close
@@ -3015,7 +3256,7 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
 
     MESH_DEBUG("irecv: comm=%p, n=%d, sizes[0]=%d", (void*)comm, n, sizes ? sizes[0] : 0);
 
-    if (!comm || !comm->qp) {
+    if (!comm || comm->num_channels < 1 || !comm->qps[0]) {
         MESH_WARN("irecv: invalid comm");
         return ncclSystemError;
     }
@@ -3050,28 +3291,72 @@ static ncclResult_t mesh_irecv(void *recvComm, int n, void **data, int *sizes,
 
     req->used = 1;
     req->size = sizes[0];
-    req->cq = comm->cq;  // Store CQ for polling
+    req->cq = comm->shared_cq;  // Store CQ for polling
     req->done = 0;
     req->comm = comm;    // Track comm for error propagation
     req->is_send = 0;
+    req->expected_completions = 1;
+    req->completed_count = 0;
+    req->has_error = 0;
+    req->error_status = IBV_WC_SUCCESS;
 
-    // Setup scatter/gather entry
-    sge.addr = (uintptr_t)data[0];
-    sge.length = sizes[0];
-    sge.lkey = lkey;
+    size_t first_size = 0;
+    int do_split = mesh_should_split((size_t)sizes[0], comm->num_channels, &first_size);
+    if (do_split) {
+        req->expected_completions = 2;
+        size_t second_size = (size_t)sizes[0] - first_size;
 
-    // Setup receive work request
-    memset(&wr, 0, sizeof(wr));
-    wr.wr_id = (uintptr_t)req;
-    wr.next = NULL;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
+        sge.addr = (uintptr_t)data[0];
+        sge.length = (uint32_t)first_size;
+        sge.lkey = lkey;
 
-    if (ibv_post_recv(comm->qp, &wr, &bad_wr)) {
-        MESH_WARN("Failed to post recv: %s", strerror(errno));
-        __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
-        free(req);
-        return ncclSystemError;
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id = (uintptr_t)req;
+        wr.next = NULL;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+
+        if (ibv_post_recv(comm->qps[0], &wr, &bad_wr)) {
+            MESH_WARN("Failed to post recv on channel 0: %s", strerror(errno));
+            __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+            free(req);
+            return ncclSystemError;
+        }
+
+        sge.addr = (uintptr_t)((char *)data[0] + first_size);
+        sge.length = (uint32_t)second_size;
+        sge.lkey = lkey;
+
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id = (uintptr_t)req;
+        wr.next = NULL;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+
+        if (ibv_post_recv(comm->qps[1], &wr, &bad_wr)) {
+            MESH_WARN("Failed to post recv on channel 1: %s", strerror(errno));
+            __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+            free(req);
+            return ncclSystemError;
+        }
+    } else {
+        int channel = 0;
+        sge.addr = (uintptr_t)data[0];
+        sge.length = sizes[0];
+        sge.lkey = lkey;
+
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id = (uintptr_t)req;
+        wr.next = NULL;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+
+        if (ibv_post_recv(comm->qps[channel], &wr, &bad_wr)) {
+            MESH_WARN("Failed to post recv: %s", strerror(errno));
+            __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
+            free(req);
+            return ncclSystemError;
+        }
     }
 
     // TICKET-9: Track request in comm for cleanup on close
@@ -3189,8 +3474,9 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
         mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
         __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mesh_state.ops_completed, 1, __ATOMIC_RELAXED);
+        ncclResult_t result = req->has_error ? ncclSystemError : ncclSuccess;
         free(req);  // TICKET-8: Free completed request to prevent memory leak
-        return ncclSuccess;
+        return result;
     }
 
     if (!req->cq) {
@@ -3232,14 +3518,20 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
                 mesh_mark_peer_failed(completed_req, wc.status);
             }
 
-            // Mark the request as done (with error)
             if (completed_req) {
-                completed_req->done = 1;
-                completed_req->wc = wc;
+                if (!completed_req->has_error) {
+                    completed_req->has_error = 1;
+                    completed_req->error_status = wc.status;
+                }
+                completed_req->completed_count++;
+                if (completed_req->completed_count >= completed_req->expected_completions) {
+                    completed_req->done = 1;
+                    completed_req->wc = wc;
+                }
             }
 
-            // If this is our request, return error immediately
-            if (completed_req == req) {
+            // If this is our request and done, return error
+            if (completed_req == req && req->done) {
                 *done = 1;
                 mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
                 __atomic_fetch_add(&g_mesh_state.requests_freed, 1, __ATOMIC_RELAXED);
@@ -3254,12 +3546,15 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
 
         // Success - mark the request as done
         if (completed_req) {
-            completed_req->done = 1;
-            completed_req->wc = wc;
+            completed_req->completed_count++;
+            if (completed_req->completed_count >= completed_req->expected_completions) {
+                completed_req->done = 1;
+                completed_req->wc = wc;
+            }
         }
 
         // Is it OUR request?
-        if (completed_req == req) {
+        if (completed_req == req && req->done) {
             *done = 1;
             if (sizes) *sizes = req->size;
             mesh_untrack_request(req);  // TICKET-9: Remove from comm tracking
@@ -3273,8 +3568,9 @@ static ncclResult_t mesh_test(void *request, int *done, int *sizes) {
                           ops, alloc, freed, alloc - freed,
                           g_mesh_state.conn_pool.hits, g_mesh_state.conn_pool.misses);
             }
+            ncclResult_t result = req->has_error ? ncclSystemError : ncclSuccess;
             free(req);  // TICKET-8: Free request on success completion
-            return ncclSuccess;
+            return result;
         }
 
         // Not our request - keep polling
@@ -3309,8 +3605,10 @@ static ncclResult_t mesh_closeSend(void *sendComm) {
             // Don't destroy QP/CQ - they belong to the pool
         } else {
             // Not pooled - destroy resources
-            if (comm->qp) ibv_destroy_qp(comm->qp);
-            if (comm->cq) ibv_destroy_cq(comm->cq);
+            for (int ch = 0; ch < comm->num_channels; ch++) {
+                if (comm->qps[ch]) ibv_destroy_qp(comm->qps[ch]);
+            }
+            if (comm->shared_cq) ibv_destroy_cq(comm->shared_cq);
         }
         free(comm);
     }
@@ -3341,8 +3639,10 @@ static ncclResult_t mesh_closeRecv(void *recvComm) {
         comm->num_requests = 0;
 
         // QP/CQ are now owned by recv_comm, destroy them
-        if (comm->qp) ibv_destroy_qp(comm->qp);
-        if (comm->cq) ibv_destroy_cq(comm->cq);
+        for (int ch = 0; ch < comm->num_channels; ch++) {
+            if (comm->qps[ch]) ibv_destroy_qp(comm->qps[ch]);
+        }
+        if (comm->shared_cq) ibv_destroy_cq(comm->shared_cq);
         free(comm);
     }
 

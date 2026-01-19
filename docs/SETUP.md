@@ -227,6 +227,15 @@ Try different GID indices:
 export NCCL_MESH_GID_INDEX=0  # or 1, 2, 3...
 ```
 
+### Dual-Channel Per Port (200Gbps)
+
+Enable dual-channel QPs and configure striping threshold:
+
+```bash
+export NCCL_MESH_DUAL_CHANNEL=1
+export NCCL_MESH_DUAL_CHANNEL_STRIPE_BYTES=1048576  # 1MB default
+```
+
 ## Scaling to 4+ Nodes: Ring Topology
 
 Full mesh becomes impractical beyond 3 nodes (N nodes requires N-1 NICs each, N*(N-1)/2 total links). For 4+ nodes, we use a **ring topology** with automatic relay routing:

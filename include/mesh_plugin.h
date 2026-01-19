@@ -75,6 +75,7 @@ struct mesh_nic {
  * Address entry for multi-homed hosts
  */
 #define MESH_MAX_ADDRS 6
+#define MESH_MAX_CHANNELS 2
 
 struct mesh_addr_entry {
     uint32_t ip;                // IP address (network byte order)
@@ -92,6 +93,8 @@ struct mesh_handle {
     uint32_t magic;             // MESH_HANDLE_MAGIC
     uint8_t  num_addrs;         // Number of valid addresses
     uint8_t  selected_idx;      // Which address was selected (set by connect)
+    uint8_t  num_channels;      // Number of QP channels supported
+    uint8_t  reserved0;         // Padding
     uint16_t lid;               // IB LID (0 for RoCE)
     uint16_t qp_num;            // QP number (for compat with mesh_connect_qp)
     uint16_t handshake_port;    // TCP port for QP handshake
@@ -101,7 +104,7 @@ struct mesh_handle {
     uint32_t handshake_ip;      // IP address for handshake (network byte order)
     union ibv_gid gid;          // GID (16 bytes)
     struct mesh_addr_entry addrs[MESH_MAX_ADDRS];  // 12 bytes each
-    // Total: 4+1+1+2+2+2+1+1+4+4+16 + 6*12 = 38 + 72 = 110 bytes (fits in 128)
+    // Total: 4+1+1+1+1+2+2+2+1+1+4+4+16 + 6*12 = 40 + 72 = 112 bytes (fits in 128)
 };
 
 /*
@@ -120,14 +123,16 @@ struct mesh_qp_info {
     uint32_t ip;           // Network byte order
     uint8_t gid_index;
     uint8_t nic_idx;       // Which NIC on the listener
-    uint8_t reserved[2];
+    uint8_t channel_count; // Number of channels in this connection
+    uint8_t channel_idx;   // Channel index for this QP
 };
 
 struct handshake_entry {
-    struct mesh_qp_info remote_info;
-    struct ibv_qp *local_qp;
-    struct ibv_cq *local_cq;
+    struct mesh_qp_info remote_info[MESH_MAX_CHANNELS];
+    struct ibv_qp *local_qp[MESH_MAX_CHANNELS];
+    struct ibv_cq *shared_cq;
     struct mesh_nic *nic;
+    int num_channels;
     int valid;
 };
 
@@ -164,9 +169,11 @@ struct mesh_listen_comm {
  */
 struct mesh_send_comm {
     struct mesh_nic *nic;
-    struct ibv_qp *qp;
-    struct ibv_cq *cq;
-    uint32_t remote_qp_num;
+    struct ibv_qp *qps[MESH_MAX_CHANNELS];
+    struct ibv_cq *shared_cq;
+    uint32_t remote_qp_num[MESH_MAX_CHANNELS];
+    int num_channels;
+    int next_channel;
     union ibv_gid remote_gid;
     int connected;
 
@@ -190,8 +197,10 @@ struct mesh_send_comm {
 
 struct mesh_recv_comm {
     struct mesh_nic *nic;
-    struct ibv_qp *qp;
-    struct ibv_cq *cq;
+    struct ibv_qp *qps[MESH_MAX_CHANNELS];
+    struct ibv_cq *shared_cq;
+    uint32_t remote_qp_num[MESH_MAX_CHANNELS];
+    int num_channels;
     int connected;
 
     // Peer health tracking
@@ -352,6 +361,10 @@ struct mesh_request {
     struct ibv_wc wc;
     void *comm;                 // Associated send/recv comm (for error propagation)
     int is_send;                // 1 if send request, 0 if recv
+    int expected_completions;   // Number of completions expected for this request
+    int completed_count;        // Number of completions received so far
+    int has_error;              // 1 if any completion reported an error
+    enum ibv_wc_status error_status; // First error status seen
 };
 
 /*
@@ -375,6 +388,8 @@ struct mesh_plugin_state {
 
     // Async connect config (TICKET-7)
     int enable_async_connect;   // NCCL_MESH_ASYNC_CONNECT: enable async connect (default: 1)
+    int enable_dual_channel;    // NCCL_MESH_DUAL_CHANNEL: enable dual-channel QPs (default: 0)
+    size_t dual_channel_threshold; // NCCL_MESH_DUAL_CHANNEL_STRIPE_BYTES (default: 1MB)
 
     // TCP fallback state (TICKET-4)
     int tcp_fallback_active;    // 1 if using TCP fallback, 0 if RDMA
@@ -416,6 +431,8 @@ struct mesh_nic* mesh_find_nic_by_name(const char *name);
 int mesh_get_nic_index(struct mesh_nic *nic);
 
 // RDMA operations
+int mesh_create_cq(struct mesh_nic *nic, struct ibv_cq **cq);
+int mesh_create_qp_with_cq(struct mesh_nic *nic, struct ibv_cq *cq, struct ibv_qp **qp);
 int mesh_create_qp(struct mesh_nic *nic, struct ibv_qp **qp, struct ibv_cq **cq);
 int mesh_connect_qp(struct ibv_qp *qp, struct mesh_nic *nic, struct mesh_handle *remote);
 int mesh_post_send(struct mesh_send_comm *comm, void *data, size_t size,

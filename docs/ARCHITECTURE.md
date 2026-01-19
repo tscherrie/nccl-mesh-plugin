@@ -421,18 +421,18 @@ Relay nodes receive data, check the header, and forward to the next hop.
 - Automatic topology discovery and BFS path selection
 - Dual-path load balancing for ring topologies
 
+#### Dual-Channel Per Port (200Gbps)
+ConnectX-7 ports expose two independent PCIe 5.0 x4 lanes:
+- Create QP pairs (one per channel) for each connection
+- Stripe data across both channels for large transfers
+- Enable with `NCCL_MESH_DUAL_CHANNEL=1` (default stripe threshold: 1MB)
+
 ### Planned Improvements
 
 #### Cut-Through Forwarding
 Reduce relay latency by forwarding packets as they arrive:
 - Don't wait for complete message before forwarding
 - Pipeline-friendly for large transfers
-
-#### Dual-Channel Per Port (200Gbps)
-ConnectX-7 ports expose two independent PCIe 5.0 x4 lanes:
-- Create QP pairs (one per channel) for each connection
-- Stripe data across both channels
-- Doubles effective bandwidth: 100Gbps → 200Gbps per cable
 
 #### Additional Optimizations
 1. **Multi-QP**: Multiple QPs per connection for parallelism
